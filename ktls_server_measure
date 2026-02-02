@@ -1,0 +1,523 @@
+#!/usr/bin/env bash
+# server_multicore_measure.sh (completion-window & payload-denominator)
+# - 윈도우 종료 조건: 서버 로그의 "COMPLETE" 라인 개수 == RUN_REQUESTS
+# - 지표 분모: 페이로드 바이트 (FILE_TO_GET × RUN_REQUESTS)
+# - TX 바이트는 참고값으로만 출력
+
+set -euo pipefail
+
+############################################
+# User-configurable variables (env overridable)
+############################################
+CPUSET=${CPUSET:-0}
+IRQ_CPUSET=${IRQ_CPUSET:-$CPUSET}
+IFACE=${IFACE:-enp161s0f0np0}
+SERVER_BIN=${SERVER_BIN:-/usr/local/src/performance_measurement_script/multi_thread_server/epoll/epoll_multi_thread_server}
+CERT=${CERT:-/etc/ssl/certs/nginx_cert.pem}
+KEY=${KEY:-/etc/ssl/private/nginx_key.pem}
+BASEDIR=${BASEDIR:-/data}
+PORT=${PORT:-4613}
+WORKERS=${WORKERS:-}
+PIN_NUMA=${PIN_NUMA:-}
+PIN_KSOFTIRQD=${PIN_KSOFTIRQD:-1}
+SET_RSS=${SET_RSS:-1}
+RSS_QUEUES=${RSS_QUEUES:-}
+SET_RPS_XPS=${SET_RPS_XPS:-1}
+PIN_IRQ=${PIN_IRQ:-1}
+USE_CGROUP=${USE_CGROUP:-1}
+
+# Traffic
+FILE_TO_GET=${FILE_TO_GET:-1G}
+RUN_REQUESTS=${RUN_REQUESTS:-1}
+
+# Server stop control (A option)
+KILL_SERVER_ON_DONE=${KILL_SERVER_ON_DONE:-0}
+
+############################################
+# Internal constants / paths
+############################################
+TS=$(date +%Y%m%d_%H%M%S)
+WORKDIR="${WORKDIR:-/usr/local/src/performance_measurement_script/multi_thread_server/epoll/mts_cpu_${TS}}"
+LOGFILE="${WORKDIR}/server.log"
+SYSBK="${WORKDIR}/sys_backup"
+CG="/sys/fs/cgroup/ktls_xfer_${TS}"
+mkdir -p "${WORKDIR}" "${SYSBK}"
+
+CLK_TCK=$(getconf CLK_TCK)
+BYTES_PER_GIB=$((1024*1024*1024))
+
+############################################
+# Helper functions
+############################################
+to_cpulist() { awk -v cpuspec="$1" '
+  BEGIN{
+    n=split(cpuspec,a,",");
+    for(i=1;i<=n;i++){
+      if(a[i] ~ /-/){
+        split(a[i],b,"-");
+        for(c=b[1];c<=b[2];c++) print c;
+      } else print a[i];
+    }
+  }'
+}
+
+validate_cpuspec_or_die() {
+  local spec="$1" name="$2"
+  if [[ ! "$spec" =~ ^[0-9,-]+$ ]]; then
+    echo "[ERR] bad ${name}: ${spec}"
+    exit 1
+  fi
+}
+
+cpuspec_to_listcsv() {
+  local spec="$1"
+  to_cpulist "$spec" | tr '\n' ',' | sed 's/,$//'
+}
+
+parse_size_bytes(){ python3 - "$1" <<'PY'
+import sys
+s=sys.argv[1].strip().upper()
+mul={'K':1024,'M':1024**2,'G':1024**3,'T':1024**4}
+print(int(float(s[:-1])*mul[s[-1]]) if s[-1] in mul else int(s))
+PY
+}
+
+have_ethtool(){ command -v ethtool >/dev/null 2>&1; }
+
+mask_from_cpulist(){ python3 - "$1" <<'PY'
+import sys
+cpus=[int(x) for x in sys.argv[1].split(',') if x!='']
+m=0
+for c in cpus: m |= (1<<c)
+print("{:x}".format(m))
+PY
+}
+
+read_proc_stat_line(){ awk -v id="$1" '$1==id{print; exit}' /proc/stat; }
+extract_irq_soft(){ awk '{print $(7), $(8)}' <<<"$1"; }
+
+gi(){ awk -v B="$1" -v G="$BYTES_PER_GIB" 'BEGIN{printf "%.3f",(B>0)?B/G:0.0}'; }
+S2GB(){ awk -v s="$1" -v B="$2" -v GiB="$BYTES_PER_GIB" 'BEGIN{if(B>0){printf "%.6f", s/(B/GiB)}else{printf "0.000000"} }'; }
+
+############################################
+# CPUSET / IRQ_CPUSET parsing
+############################################
+validate_cpuspec_or_die "$CPUSET" "CPUSET"
+CPULIST=$(cpuspec_to_listcsv "$CPUSET")
+CPU_ARR=($(echo "$CPULIST" | tr ',' ' '))
+NCPU=${#CPU_ARR[@]}
+
+# IRQ CPUSET (default: CPUSET)
+IRQ_CPUSET=${IRQ_CPUSET:-$CPUSET}
+validate_cpuspec_or_die "$IRQ_CPUSET" "IRQ_CPUSET"
+IRQ_CPULIST=$(cpuspec_to_listcsv "$IRQ_CPUSET")
+IRQ_CPU_ARR=($(echo "$IRQ_CPULIST" | tr ',' ' '))
+NIRQCPU=${#IRQ_CPU_ARR[@]}
+
+# softirq/IRQ measurement cores = CPUSET ∪ IRQ_CPUSET
+MON_CPULIST=$(
+  printf "%s\n%s\n" "$CPULIST" "$IRQ_CPULIST" \
+  | tr ',' '\n' \
+  | awk 'NF{ if (!seen[$1]++) print $1 }' \
+  | sort -n \
+  | tr '\n' ',' \
+  | sed 's/,$//'
+)
+MON_CPU_ARR=($(echo "$MON_CPULIST" | tr ',' ' '))
+NMONCPU=${#MON_CPU_ARR[@]}
+
+# Defaults derived from CPUSET
+[[ -z "$WORKERS" ]] && WORKERS=$NCPU
+[[ -z "${RSS_QUEUES}" ]] && RSS_QUEUES=$NCPU
+
+FILE_BYTES=$(parse_size_bytes "$FILE_TO_GET")
+PAYLOAD_BYTES=$(( FILE_BYTES * RUN_REQUESTS ))   # 정확한 분모
+
+############################################
+# cgroup v2 helpers
+############################################
+cg_create(){ [[ "${USE_CGROUP}" = "1" ]] || return 0; mkdir -p "$CG"; }
+cg_add(){ [[ "${USE_CGROUP}" = "1" ]] || return 0; echo "$1" > "$CG/cgroup.procs" 2>/dev/null || true; }
+cg_read_cpu_stat(){
+  [[ "${USE_CGROUP}" = "1" ]] || { echo "0 0 0"; return 0; }
+  awk '{a[$1]=$2} END{print a["usage_usec"]+0, a["user_usec"]+0, a["system_usec"]+0}' "$CG/cpu.stat"
+}
+cg_cleanup(){ [[ "${USE_CGROUP}" = "1" ]] || return 0; rmdir "$CG" 2>/dev/null || true; }
+
+############################################
+# irqbalance control
+############################################
+stop_irqbalance(){ systemctl stop irqbalance 2>/dev/null || true; echo "[INFO] irqbalance stopped"; }
+restore_irqbalance(){ systemctl start irqbalance 2>/dev/null || true; echo "[CLEANUP] irqbalance started"; }
+
+############################################
+# RSS (ethtool -L)
+############################################
+get_preset_max(){
+  have_ethtool || { echo ""; return 0; }
+  ethtool -l "$IFACE" 2>/dev/null | awk '/Pre-set maximums:/{f=1;next} f&&$1=="Combined:"{print $2;exit}'
+}
+get_current_combined(){
+  have_ethtool || { echo ""; return 0; }
+  ethtool -l "$IFACE" 2>/dev/null | awk '/Current hardware settings:/{f=1;next} f&&$1=="Combined:"{print $2;exit}'
+}
+verify_queues(){ local want="$1"; local cur="$(get_current_combined || true)"; [[ "$cur" == "$want" ]]; }
+
+shrink_to_n(){
+  local want="$1"
+  local preset
+  local orig="${SYSBK}/preset_queues"
+
+  preset="$(get_preset_max || true)"
+  [[ -n "$preset" ]] && echo "$preset" > "$orig" || echo "unknown" > "$orig"
+
+  if have_ethtool; then
+    ethtool -L "$IFACE" combined "$want" >/dev/null 2>&1 || true
+    sleep 0.2
+    if verify_queues "$want"; then
+      echo "[INFO] ${IFACE}: queues set to ${want}"
+    else
+      echo "[WARN] queues set may need link flap"
+    fi
+  fi
+}
+
+restore_queues(){
+  local orig="${SYSBK}/preset_queues"
+  [[ -f "$orig" ]] || { echo "[CLEANUP] no queue backup"; return 0; }
+
+  local target
+  target="$(cat "$orig")"
+  [[ "$target" == "unknown" || -z "$target" ]] && { echo "[CLEANUP] queue restore skipped"; return 0; }
+
+  local cur
+  cur="$(get_current_combined || true)"
+  [[ "$cur" == "$target" ]] && { echo "[CLEANUP] queues already ${target}"; return 0; }
+
+  have_ethtool && ethtool -L "$IFACE" combined "$target" >/dev/null 2>&1 || true
+  sleep 0.2
+
+  if verify_queues "$target"; then
+    echo "[CLEANUP] queues restored: ${cur:-?} -> ${target}"
+  else
+    echo "[CLEANUP][NEEDS-FLAP] ip link set $IFACE down && ethtool -L $IFACE combined $target && ip link set $IFACE up"
+  fi
+}
+
+############################################
+# RPS/XPS
+############################################
+disable_rps_xps(){
+  local qdir="/sys/class/net/${IFACE}/queues"
+  [[ -d "$qdir" ]] || return 0
+
+  mkdir -p "${SYSBK}/rps" "${SYSBK}/xps"
+
+  # IRQ 코어 집합으로 RPS/XPS 설정
+  local mask_hex
+  mask_hex=$(mask_from_cpulist "$IRQ_CPULIST")
+
+  for f in "$qdir"/rx-*/rps_cpus; do
+    [[ -f "$f" ]] && {
+      cp "$f" "${SYSBK}/rps/$(basename "$(dirname "$f")")" 2>/dev/null || true
+      echo "$mask_hex" > "$f" 2>/dev/null || true
+    }
+  done
+
+  for f in "$qdir"/tx-*/xps_cpus; do
+    [[ -f "$f" ]] && {
+      cp "$f" "${SYSBK}/xps/$(basename "$(dirname "$f")")" 2>/dev/null || true
+      echo "$mask_hex" > "$f" 2>/dev/null || true
+    }
+  done
+
+  echo "[INFO] RPS/XPS set to IRQ_CPUSET=${IRQ_CPUSET} (mask=0x${mask_hex})"
+}
+
+restore_rps_xps(){
+  local qdir="/sys/class/net/${IFACE}/queues"
+
+  if [[ -d "${SYSBK}/rps" ]]; then
+    for f in "${SYSBK}"/rps/*; do
+      local q; q=$(basename "$f")
+      [[ -f "$qdir/$q/rps_cpus" ]] && cat "$f" > "$qdir/$q/rps_cpus" || true
+    done
+    echo "[CLEANUP] RPS restored"
+  fi
+
+  if [[ -d "${SYSBK}/xps" ]]; then
+    for f in "${SYSBK}"/xps/*; do
+      local q; q=$(basename "$f")
+      [[ -f "$qdir/$q/xps_cpus" ]] && cat "$f" > "$qdir/$q/xps_cpus" || true
+    done
+    echo "[CLEANUP] XPS restored"
+  fi
+}
+
+############################################
+# IRQ affinity
+############################################
+pci_bdf_of_iface() {
+  readlink -f "/sys/class/net/${IFACE}/device" | awk -F/ '{print $NF}'
+}
+
+collect_irqs() {
+  local bdf
+  bdf="$(pci_bdf_of_iface)"
+  [[ -n "$bdf" ]] || return 0
+
+  awk -v pat="$bdf" '
+    /^[ 0-9]+:/ {
+      gsub(":", "", $1); irq=$1
+      if (index($0, pat) && index($0, "mlx5_comp") ) print irq
+    }' /proc/interrupts \
+    | sort -n \
+    | head -n "${RSS_QUEUES:-1}"
+}
+
+affine_irqs_round_robin(){
+  local irqs=($(collect_irqs))
+  ((${#irqs[@]})) || { echo "[INFO] No IRQs for ${IFACE}"; return 0; }
+
+  local idx=0
+  for irq in "${irqs[@]}"; do
+    [[ -f "/proc/irq/${irq}/smp_affinity_list" ]] || continue
+
+    cat "/proc/irq/${irq}/smp_affinity_list" > "${SYSBK}/irq_${irq}.aff" 2>/dev/null || true
+
+    # IRQ_CPUSET 안에서 라운드로빈
+    local cpu="${IRQ_CPU_ARR[$((idx%NIRQCPU))]}"
+    echo "$cpu" > "/proc/irq/${irq}/smp_affinity_list" 2>/dev/null || true
+    echo "[INFO] IRQ ${irq} -> CPU ${cpu}"
+    idx=$((idx+1))
+  done
+
+  printf "%s\n" "${irqs[@]}" > "${SYSBK}/irq_list.txt"
+}
+
+restore_irq_aff(){
+  [[ -f "${SYSBK}/irq_list.txt" ]] || return 0
+  while read -r irq; do
+    [[ -f "/proc/irq/${irq}/smp_affinity_list" && -f "${SYSBK}/irq_${irq}.aff" ]] && \
+      cat "${SYSBK}/irq_${irq}.aff" > "/proc/irq/${irq}/smp_affinity_list" || true
+  done < "${SYSBK}/irq_list.txt"
+  echo "[CLEANUP] IRQ smp_affinity_list restored"
+}
+
+############################################
+# ksoftirqd pin/unpin
+############################################
+pin_ksoftirqd_all(){
+  [[ "${PIN_KSOFTIRQD}" = "1" ]] || { echo "[INFO] skip ksoftirqd pin"; return 0; }
+
+  ps -eLo pid,psr,comm | awk '$3 ~ /^ksoftirqd\/[0-9]+$/ {print $1,$2,$3}' | \
+  while read -r pid cpu comm; do
+    local n; n=${comm#ksoftirqd/}
+    if [[ ",$IRQ_CPULIST," == *",$n,"* ]]; then
+      taskset -p "$(printf %x $((1<<n)))" "$pid" >/dev/null 2>&1 || true
+      echo "$pid" > "${SYSBK}/ksoft_pid_${n}" 2>/dev/null || true
+      echo "[INFO] pinned $comm (pid=$pid) -> CPU $n"
+    fi
+  done
+}
+
+restore_ksoft(){
+  shopt -s nullglob
+  for f in "${SYSBK}"/ksoft_pid_*; do
+    local n=${f##*_}
+    local pid; pid=$(cat "$f" 2>/dev/null || true)
+    [[ -n "$pid" ]] && taskset -p ff "$pid" >/dev/null 2>&1 || true
+  done
+  shopt -u nullglob
+  echo "[CLEANUP] ksoftirqd affinity restored (best effort)"
+}
+
+############################################
+# IFACE TX (reference only)
+############################################
+read_tx_bytes(){ awk -v dev="$IFACE" '$1==dev":"{print $10}' /proc/net/dev 2>/dev/null | tr -d ' '; }
+
+############################################
+# Cleanup (trap)
+############################################
+cleanup(){
+  restore_irq_aff
+  restore_queues
+  restore_rps_xps
+  restore_ksoft
+  restore_irqbalance
+  cg_cleanup
+}
+trap cleanup EXIT
+
+############################################
+# Apply tunings
+############################################
+echo "[INFO] IFACE=$IFACE  CPUSET=$CPUSET (NCPU=$NCPU)  IRQ_CPUSET=$IRQ_CPUSET (NIRQCPU=$NIRQCPU)  WORKERS=$WORKERS"
+stop_irqbalance
+[[ "${SET_RSS}" = "1" ]] && shrink_to_n "${RSS_QUEUES}"
+[[ "${PIN_IRQ}" = "1" ]] && affine_irqs_round_robin
+[[ "${SET_RPS_XPS}" = "1" ]] && disable_rps_xps
+[[ "${PIN_KSOFTIRQD}" = "1" ]] && pin_ksoftirqd_all
+
+############################################
+# Launch server
+############################################
+CMD_PREFIX=()
+if [[ -n "${PIN_NUMA}" && -x "$(command -v numactl)" ]]; then
+  CMD_PREFIX+=(numactl --cpunodebind="${PIN_NUMA}" --membind="${PIN_NUMA}")
+fi
+if [[ -n "$CPUSET" ]]; then
+  CMD_PREFIX+=(taskset -c "$CPUSET")
+fi
+
+echo "[INFO] Launch: ${CMD_PREFIX[*]} $SERVER_BIN $PORT $CERT $KEY $BASEDIR $WORKERS"
+stdbuf -oL -eL "${CMD_PREFIX[@]}" "$SERVER_BIN" "$PORT" "$CERT" "$KEY" "$BASEDIR" "$WORKERS" >"${LOGFILE}" 2>&1 & SERVER_PID=$!
+
+cg_create
+cg_add "$SERVER_PID"
+
+############################################
+# Wait for first TX activity (t0 close to first send)
+############################################
+echo "[INFO] Waiting for TX activity on $IFACE ..."
+TX0=$(read_tx_bytes); [[ -z "$TX0" ]] && TX0=0
+while :; do
+  sleep 0.05
+  TX=$(read_tx_bytes); [[ -z "$TX" ]] && TX=$TX0
+  (( TX > TX0 )) && break
+  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    echo "[ERR] server exited before activity"
+    exit 1
+  fi
+done
+
+############################################
+# Snapshot (start)
+############################################
+declare -A S0_IRQ S0_SIRQ
+for c in "${MON_CPU_ARR[@]}"; do
+  line=$(read_proc_stat_line "cpu${c}")
+  read hi so < <(extract_irq_soft "$line")
+  S0_IRQ[$c]=$hi
+  S0_SIRQ[$c]=$so
+done
+
+declare -A KSOFT0_NS KSOFT1_NS
+while read -r pid psr comm; do
+  [[ "$comm" =~ ^ksoftirqd/([0-9]+)$ ]] || continue
+  n="${BASH_REMATCH[1]}"
+  [[ ",$MON_CPULIST," == *",$n,"* ]] || continue
+  KSOFT0_NS[$n]=$(awk '{print $1}' "/proc/$pid/schedstat" 2>/dev/null || echo 0)
+done < <(ps -eLo pid,psr,comm)
+
+read CG_U0 CG_USER0 CG_SYS0 < <(cg_read_cpu_stat)
+
+TX_START=$(read_tx_bytes)
+T0=$(date +%s%N)
+
+############################################
+# Completion-window wait (count COMPLETE lines)
+############################################
+COMP_SEEN=0
+(
+  tail -n0 -F "$LOGFILE" 2>/dev/null & echo $! > "${WORKDIR}/tail.pid"
+) | while read -r line; do
+  [[ "$line" =~ ^COMPLETE[[:space:]] ]] && (( ++COMP_SEEN ))
+  if (( COMP_SEEN >= RUN_REQUESTS )); then
+    tailpid=$(cat "${WORKDIR}/tail.pid" 2>/dev/null || echo "")
+    [[ -n "$tailpid" ]] && kill "$tailpid" 2>/dev/null || true
+    break
+  fi
+done
+
+T1=$(date +%s%N)
+TX_END=$(read_tx_bytes)
+REQ_WINDOW=$(awk -v a="$T0" -v b="$T1" 'BEGIN{printf "%.3f",(b-a)/1e9}')
+
+############################################
+# Snapshot (end)
+############################################
+declare -A S1_IRQ S1_SIRQ
+for c in "${MON_CPU_ARR[@]}"; do
+  line=$(read_proc_stat_line "cpu${c}")
+  read hi so < <(extract_irq_soft "$line")
+  S1_IRQ[$c]=$hi
+  S1_SIRQ[$c]=$so
+done
+
+while read -r pid psr comm; do
+  [[ "$comm" =~ ^ksoftirqd/([0-9]+)$ ]] || continue
+  n="${BASH_REMATCH[1]}"
+  [[ ",$MON_CPULIST," == *",$n,"* ]] || continue
+  KSOFT1_NS[$n]=$(awk '{print $1}' "/proc/$pid/schedstat" 2>/dev/null || echo 0)
+done < <(ps -eLo pid,psr,comm)
+
+read CG_U1 CG_USER1 CG_SYS1 < <(cg_read_cpu_stat)
+
+############################################
+# Optional: stop server
+############################################
+if [[ "${KILL_SERVER_ON_DONE}" = "1" ]]; then
+  kill "$SERVER_PID" 2>/dev/null || true
+  wait "$SERVER_PID" 2>/dev/null || true
+fi
+
+############################################
+# Calculations / report
+############################################
+# Kernel time sum (CPUSET ∪ IRQ_CPUSET)
+sum_irq=0
+sum_sirq=0
+for c in "${MON_CPU_ARR[@]}"; do
+  sum_irq=$(awk -v s="$sum_irq" -v a="${S0_IRQ[$c]}"  -v b="${S1_IRQ[$c]}"  -v hz="$CLK_TCK" 'BEGIN{printf "%.6f", s+ (b-a)/hz}')
+  sum_sirq=$(awk -v s="$sum_sirq" -v a="${S0_SIRQ[$c]}" -v b="${S1_SIRQ[$c]}" -v hz="$CLK_TCK" 'BEGIN{printf "%.6f", s+ (b-a)/hz}')
+done
+
+# ksoftirqd separated -> inline
+ksum=0
+for n in "${MON_CPU_ARR[@]}"; do
+  k0="${KSOFT0_NS[$n]:-0}"
+  k1="${KSOFT1_NS[$n]:-0}"
+  ksum=$(awk -v s="$ksum" -v a="$k0" -v b="$k1" 'BEGIN{printf "%.6f", s+ (b-a)/1e9}')
+done
+sirq_inline=$(awk -v so="$sum_sirq" -v kr="$ksum" 'BEGIN{d=so-kr; if(d<0)d=0; printf "%.6f", d;}')
+
+# cgroup stats
+if [[ "${USE_CGROUP}" = "1" ]]; then
+  CG_TOT=$(awk -v a="$CG_U0"    -v b="$CG_U1"    'BEGIN{printf "%.6f",(b-a)/1e6}')
+  CG_USER=$(awk -v a="$CG_USER0" -v b="$CG_USER1" 'BEGIN{printf "%.6f",(b-a)/1e6}')
+  CG_SYS=$(awk -v a="$CG_SYS0"  -v b="$CG_SYS1"  'BEGIN{printf "%.6f",(b-a)/1e6}')
+else
+  CG_TOT=0; CG_USER=0; CG_SYS=0
+fi
+
+# Reference-only TX delta (denominator is PAYLOAD_BYTES)
+TX_BYTES=$(( TX_END - TX_START ))
+
+TOTAL_TRUE=$(awk -v s="$CG_TOT" -v so="$sum_sirq" -v hi="$sum_irq" 'BEGIN{printf "%.6f", s+so+hi}')
+
+echo
+printf "=== CPU Time (Completion Window | CPUSET=%s, IRQ_CPUSET=%s) ===\n" "$CPUSET" "$IRQ_CPUSET"
+printf "Payload(bytes)   : %d  (%.3f GiB)\n" "$PAYLOAD_BYTES" "$(gi "$PAYLOAD_BYTES")"
+printf "TX observed      : %d  (%.3f GiB)   # reference only\n" "$TX_BYTES"      "$(gi "$TX_BYTES")"
+printf "Window(sec)      : %.3f\n\n" "${REQ_WINDOW:-0}"
+
+printf "# App (cgroup v2, all threads)\n"
+printf "cgroup total     : %.3f s   → %.3f s/GB(payload)\n" "$CG_TOT"  "$(S2GB "$CG_TOT" "$PAYLOAD_BYTES")"
+printf "  user/system    : %.3f / %.3f s\n\n" "$CG_USER" "$CG_SYS"
+
+printf "# Kernel (IRQ+softirq on CPUSET ∪ IRQ_CPUSET)\n"
+printf "softirq(total)   : %.3f s   → %.3f s/GB(payload)\n" "$sum_sirq"    "$(S2GB "$sum_sirq" "$PAYLOAD_BYTES")"
+printf "  ├─ ksoftirqd   : %.3f s   → %.3f s/GB(payload)\n" "$ksum"        "$(S2GB "$ksum"     "$PAYLOAD_BYTES")"
+printf "  └─ inline      : %.3f s   → %.3f s/GB(payload)\n" "$sirq_inline" "$(S2GB "$sirq_inline" "$PAYLOAD_BYTES")"
+printf "IRQ(hard)        : %.3f s   → %.3f s/GB(payload)\n\n" "$sum_irq"     "$(S2GB "$sum_irq"  "$PAYLOAD_BYTES")"
+
+printf "# Combined (no double counting)\n"
+printf "TOTAL (App+soft+IRQ): %.3f s  → %.3f s/GB(payload)\n" "$TOTAL_TRUE" "$(S2GB "$TOTAL_TRUE" "$PAYLOAD_BYTES")"
+if [[ -n "${REQ_WINDOW:-}" && "${REQ_WINDOW}" != "0" ]]; then
+  printf "CPU vs wall          : %.1f %%  (TOTAL / WINDOW)\n" \
+    "$(awk -v t="$TOTAL_TRUE" -v w="$REQ_WINDOW" 'BEGIN{if(w>0)print 100*t/w; else print 0;}')"
+fi
+
+exit 0
