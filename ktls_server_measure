@@ -1,14 +1,22 @@
 #!/usr/bin/env bash
-# server_multicore_measure.sh (completion-window & payload-denominator)
-# - 윈도우 종료 조건: 서버 로그의 "COMPLETE" 라인 개수 == RUN_REQUESTS
-# - 지표 분모: 페이로드 바이트 (FILE_TO_GET × RUN_REQUESTS)
-# - TX 바이트는 참고값으로만 출력
+# server_multicore_measure.sh
+#
+# 목적
+# - 멀티코어(멀티 워커) 서버 전송 실험에서 "요청 처리 구간(윈도우)"만 정확히 잘라 CPU 시간을 측정한다.
+#
+# 측정 윈도우 정의 (start/end)
+# - 시작: IFACE의 TX 바이트가 처음 증가하는 시점(= 실제 전송이 시작되는 순간에 최대한 근접)
+# - 종료: 서버 로그에서 "COMPLETE" 라인이 RUN_REQUESTS개 관측되는 시점(= 요청이 모두 완료된 순간)
+#
+# s/GB(또는 s/GiB) 분모(denominator)
+# - /proc/net/dev TX 바이트가 아닌, "실제 페이로드 바이트"를 분모로 사용한다.
+#   = FILE_TO_GET(요청 1회당 파일 크기) × RUN_REQUESTS(요청 횟수)
+# - /proc/net/dev의 TX 바이트는 헤더/재전송 등 영향이 포함될 수 있어 참고값으로만 출력한다.
+
 
 set -euo pipefail
 
-############################################
-# User-configurable variables (env overridable)
-############################################
+# 사용자 설정 변수
 CPUSET=${CPUSET:-0}
 IRQ_CPUSET=${IRQ_CPUSET:-$CPUSET}
 IFACE=${IFACE:-enp161s0f0np0}
@@ -26,16 +34,15 @@ SET_RPS_XPS=${SET_RPS_XPS:-1}
 PIN_IRQ=${PIN_IRQ:-1}
 USE_CGROUP=${USE_CGROUP:-1}
 
-# Traffic
+# 요청 관련 설정
 FILE_TO_GET=${FILE_TO_GET:-1G}
 RUN_REQUESTS=${RUN_REQUESTS:-1}
 
-# Server stop control (A option)
+# 측정 종료 후 서버를 종료할지 여부
 KILL_SERVER_ON_DONE=${KILL_SERVER_ON_DONE:-0}
 
-############################################
-# Internal constants / paths
-############################################
+
+# 내부 상수/경로
 TS=$(date +%Y%m%d_%H%M%S)
 WORKDIR="${WORKDIR:-/usr/local/src/performance_measurement_script/multi_thread_server/epoll/mts_cpu_${TS}}"
 LOGFILE="${WORKDIR}/server.log"
@@ -43,12 +50,14 @@ SYSBK="${WORKDIR}/sys_backup"
 CG="/sys/fs/cgroup/ktls_xfer_${TS}"
 mkdir -p "${WORKDIR}" "${SYSBK}"
 
+# /proc/stat의 jiffies → 초 변환에 필요한 HZ 값
 CLK_TCK=$(getconf CLK_TCK)
+
+# GiB 변환 상수
 BYTES_PER_GIB=$((1024*1024*1024))
 
-############################################
-# Helper functions
-############################################
+
+# CPU 스펙("0-3,8,10-11")을 실제 CPU 번호 목록으로 변환
 to_cpulist() { awk -v cpuspec="$1" '
   BEGIN{
     n=split(cpuspec,a,",");
@@ -61,6 +70,7 @@ to_cpulist() { awk -v cpuspec="$1" '
   }'
 }
 
+# CPU 스펙 문자열 형식 검증
 validate_cpuspec_or_die() {
   local spec="$1" name="$2"
   if [[ ! "$spec" =~ ^[0-9,-]+$ ]]; then
@@ -69,11 +79,13 @@ validate_cpuspec_or_die() {
   fi
 }
 
+# CPU 스펙 → CSV (예: "0-3,8" → "0,1,2,3,8")
 cpuspec_to_listcsv() {
   local spec="$1"
   to_cpulist "$spec" | tr '\n' ',' | sed 's/,$//'
 }
 
+# "1G/512M/1024" 같은 size를 바이트로 변환
 parse_size_bytes(){ python3 - "$1" <<'PY'
 import sys
 s=sys.argv[1].strip().upper()
@@ -82,8 +94,10 @@ print(int(float(s[:-1])*mul[s[-1]]) if s[-1] in mul else int(s))
 PY
 }
 
+# ethtool 존재 여부
 have_ethtool(){ command -v ethtool >/dev/null 2>&1; }
 
+# CPU 리스트 CSV(예:"0,2,3")를 smp_affinity 등에 쓰는 hex 마스크로 변환
 mask_from_cpulist(){ python3 - "$1" <<'PY'
 import sys
 cpus=[int(x) for x in sys.argv[1].split(',') if x!='']
@@ -93,28 +107,33 @@ print("{:x}".format(m))
 PY
 }
 
+# /proc/stat에서 특정 cpu 라인(cpu0/cpu1 등) 한 줄만 읽기
 read_proc_stat_line(){ awk -v id="$1" '$1==id{print; exit}' /proc/stat; }
+
+# /proc/stat cpu 라인에서 irq(7번째), softirq(8번째) 필드 추출
 extract_irq_soft(){ awk '{print $(7), $(8)}' <<<"$1"; }
 
+# 바이트를 GiB로 출력(소수점 3자리)
 gi(){ awk -v B="$1" -v G="$BYTES_PER_GIB" 'BEGIN{printf "%.3f",(B>0)?B/G:0.0}'; }
+
+# seconds를 payload(바이트) 기준 s/GB로 변환
 S2GB(){ awk -v s="$1" -v B="$2" -v GiB="$BYTES_PER_GIB" 'BEGIN{if(B>0){printf "%.6f", s/(B/GiB)}else{printf "0.000000"} }'; }
 
-############################################
-# CPUSET / IRQ_CPUSET parsing
-############################################
+
+# CPUSET / IRQ_CPUSET 파싱
 validate_cpuspec_or_die "$CPUSET" "CPUSET"
 CPULIST=$(cpuspec_to_listcsv "$CPUSET")
 CPU_ARR=($(echo "$CPULIST" | tr ',' ' '))
 NCPU=${#CPU_ARR[@]}
 
-# IRQ CPUSET (default: CPUSET)
+# IRQ CPUSET (기본값: CPUSET)
 IRQ_CPUSET=${IRQ_CPUSET:-$CPUSET}
 validate_cpuspec_or_die "$IRQ_CPUSET" "IRQ_CPUSET"
 IRQ_CPULIST=$(cpuspec_to_listcsv "$IRQ_CPUSET")
 IRQ_CPU_ARR=($(echo "$IRQ_CPULIST" | tr ',' ' '))
 NIRQCPU=${#IRQ_CPU_ARR[@]}
 
-# softirq/IRQ measurement cores = CPUSET ∪ IRQ_CPUSET
+# softirq/IRQ 측정 코어 집합 = CPUSET ∪ IRQ_CPUSET
 MON_CPULIST=$(
   printf "%s\n%s\n" "$CPULIST" "$IRQ_CPULIST" \
   | tr ',' '\n' \
@@ -126,33 +145,35 @@ MON_CPULIST=$(
 MON_CPU_ARR=($(echo "$MON_CPULIST" | tr ',' ' '))
 NMONCPU=${#MON_CPU_ARR[@]}
 
-# Defaults derived from CPUSET
+# WORKERS/RSS_QUEUES 기본값: CPUSET 코어 수로 자동 설정
 [[ -z "$WORKERS" ]] && WORKERS=$NCPU
 [[ -z "${RSS_QUEUES}" ]] && RSS_QUEUES=$NCPU
 
+# 페이로드 분모(정확한 분모): FILE_TO_GET × RUN_REQUESTS
 FILE_BYTES=$(parse_size_bytes "$FILE_TO_GET")
-PAYLOAD_BYTES=$(( FILE_BYTES * RUN_REQUESTS ))   # 정확한 분모
+PAYLOAD_BYTES=$(( FILE_BYTES * RUN_REQUESTS ))
 
-############################################
-# cgroup v2 helpers
-############################################
+
+# cgroup v2 관련 헬퍼
 cg_create(){ [[ "${USE_CGROUP}" = "1" ]] || return 0; mkdir -p "$CG"; }
 cg_add(){ [[ "${USE_CGROUP}" = "1" ]] || return 0; echo "$1" > "$CG/cgroup.procs" 2>/dev/null || true; }
+
+# cgroup cpu.stat에서 usage/user/system(usec)을 읽어오기
 cg_read_cpu_stat(){
   [[ "${USE_CGROUP}" = "1" ]] || { echo "0 0 0"; return 0; }
   awk '{a[$1]=$2} END{print a["usage_usec"]+0, a["user_usec"]+0, a["system_usec"]+0}' "$CG/cpu.stat"
 }
+
+# cgroup 정리(존재하면 삭제)
 cg_cleanup(){ [[ "${USE_CGROUP}" = "1" ]] || return 0; rmdir "$CG" 2>/dev/null || true; }
 
-############################################
-# irqbalance control
-############################################
+
+# irqbalance 제어
 stop_irqbalance(){ systemctl stop irqbalance 2>/dev/null || true; echo "[INFO] irqbalance stopped"; }
 restore_irqbalance(){ systemctl start irqbalance 2>/dev/null || true; echo "[CLEANUP] irqbalance started"; }
 
-############################################
-# RSS (ethtool -L)
-############################################
+
+# RSS 큐 수 조정 (ethtool -L)
 get_preset_max(){
   have_ethtool || { echo ""; return 0; }
   ethtool -l "$IFACE" 2>/dev/null | awk '/Pre-set maximums:/{f=1;next} f&&$1=="Combined:"{print $2;exit}'
@@ -163,6 +184,7 @@ get_current_combined(){
 }
 verify_queues(){ local want="$1"; local cur="$(get_current_combined || true)"; [[ "$cur" == "$want" ]]; }
 
+# 큐 수를 want로 설정(원래 preset 최대값은 백업)
 shrink_to_n(){
   local want="$1"
   local preset
@@ -182,6 +204,7 @@ shrink_to_n(){
   fi
 }
 
+# 큐 수를 원래 값으로 복구(가능한 경우)
 restore_queues(){
   local orig="${SYSBK}/preset_queues"
   [[ -f "$orig" ]] || { echo "[CLEANUP] no queue backup"; return 0; }
@@ -204,16 +227,14 @@ restore_queues(){
   fi
 }
 
-############################################
-# RPS/XPS
-############################################
+# RPS/XPS 설정/복구
 disable_rps_xps(){
   local qdir="/sys/class/net/${IFACE}/queues"
   [[ -d "$qdir" ]] || return 0
 
   mkdir -p "${SYSBK}/rps" "${SYSBK}/xps"
 
-  # IRQ 코어 집합으로 RPS/XPS 설정
+  # IRQ_CPUSET에 해당하는 CPU 마스크로 RPS/XPS 설정
   local mask_hex
   mask_hex=$(mask_from_cpulist "$IRQ_CPULIST")
 
@@ -234,6 +255,7 @@ disable_rps_xps(){
   echo "[INFO] RPS/XPS set to IRQ_CPUSET=${IRQ_CPUSET} (mask=0x${mask_hex})"
 }
 
+# 백업해둔 RPS/XPS 값 복원
 restore_rps_xps(){
   local qdir="/sys/class/net/${IFACE}/queues"
 
@@ -254,13 +276,12 @@ restore_rps_xps(){
   fi
 }
 
-############################################
-# IRQ affinity
-############################################
+# IRQ affinity 설정/복구 (mlx5_comp 중심)
 pci_bdf_of_iface() {
   readlink -f "/sys/class/net/${IFACE}/device" | awk -F/ '{print $NF}'
 }
 
+# /proc/interrupts에서 mlx5_comp IRQ를 수집(RSS_QUEUES 개수만큼)
 collect_irqs() {
   local bdf
   bdf="$(pci_bdf_of_iface)"
@@ -275,6 +296,7 @@ collect_irqs() {
     | head -n "${RSS_QUEUES:-1}"
 }
 
+# 수집한 IRQ를 IRQ_CPUSET 내부에서 라운드로빈으로 배치
 affine_irqs_round_robin(){
   local irqs=($(collect_irqs))
   ((${#irqs[@]})) || { echo "[INFO] No IRQs for ${IFACE}"; return 0; }
@@ -285,7 +307,6 @@ affine_irqs_round_robin(){
 
     cat "/proc/irq/${irq}/smp_affinity_list" > "${SYSBK}/irq_${irq}.aff" 2>/dev/null || true
 
-    # IRQ_CPUSET 안에서 라운드로빈
     local cpu="${IRQ_CPU_ARR[$((idx%NIRQCPU))]}"
     echo "$cpu" > "/proc/irq/${irq}/smp_affinity_list" 2>/dev/null || true
     echo "[INFO] IRQ ${irq} -> CPU ${cpu}"
@@ -295,6 +316,7 @@ affine_irqs_round_robin(){
   printf "%s\n" "${irqs[@]}" > "${SYSBK}/irq_list.txt"
 }
 
+# IRQ affinity를 백업 값으로 복구
 restore_irq_aff(){
   [[ -f "${SYSBK}/irq_list.txt" ]] || return 0
   while read -r irq; do
@@ -304,9 +326,8 @@ restore_irq_aff(){
   echo "[CLEANUP] IRQ smp_affinity_list restored"
 }
 
-############################################
 # ksoftirqd pin/unpin
-############################################
+# ksoftirqd/N 스레드를 IRQ_CPUSET 코어로 고정(가능한 범위에서)
 pin_ksoftirqd_all(){
   [[ "${PIN_KSOFTIRQD}" = "1" ]] || { echo "[INFO] skip ksoftirqd pin"; return 0; }
 
@@ -321,6 +342,7 @@ pin_ksoftirqd_all(){
   done
 }
 
+# ksoftirqd affinity를 가능한 범위에서 복구(best effort)
 restore_ksoft(){
   shopt -s nullglob
   for f in "${SYSBK}"/ksoft_pid_*; do
@@ -332,14 +354,12 @@ restore_ksoft(){
   echo "[CLEANUP] ksoftirqd affinity restored (best effort)"
 }
 
-############################################
-# IFACE TX (reference only)
-############################################
+
+# IFACE TX 바이트 읽기 (참고용)
 read_tx_bytes(){ awk -v dev="$IFACE" '$1==dev":"{print $10}' /proc/net/dev 2>/dev/null | tr -d ' '; }
 
-############################################
-# Cleanup (trap)
-############################################
+
+# 종료 시 복구(trap)
 cleanup(){
   restore_irq_aff
   restore_queues
@@ -350,9 +370,8 @@ cleanup(){
 }
 trap cleanup EXIT
 
-############################################
-# Apply tunings
-############################################
+
+# 최적화 적용
 echo "[INFO] IFACE=$IFACE  CPUSET=$CPUSET (NCPU=$NCPU)  IRQ_CPUSET=$IRQ_CPUSET (NIRQCPU=$NIRQCPU)  WORKERS=$WORKERS"
 stop_irqbalance
 [[ "${SET_RSS}" = "1" ]] && shrink_to_n "${RSS_QUEUES}"
@@ -360,14 +379,16 @@ stop_irqbalance
 [[ "${SET_RPS_XPS}" = "1" ]] && disable_rps_xps
 [[ "${PIN_KSOFTIRQD}" = "1" ]] && pin_ksoftirqd_all
 
-############################################
-# Launch server
-############################################
+
+
+# 서버 실행
 CMD_PREFIX=()
 if [[ -n "${PIN_NUMA}" && -x "$(command -v numactl)" ]]; then
+  # NUMA 바인딩 (CPU 노드/메모리 노드)
   CMD_PREFIX+=(numactl --cpunodebind="${PIN_NUMA}" --membind="${PIN_NUMA}")
 fi
 if [[ -n "$CPUSET" ]]; then
+  # CPUSET 코어로 프로세스 바인딩
   CMD_PREFIX+=(taskset -c "$CPUSET")
 fi
 
@@ -377,9 +398,8 @@ stdbuf -oL -eL "${CMD_PREFIX[@]}" "$SERVER_BIN" "$PORT" "$CERT" "$KEY" "$BASEDIR
 cg_create
 cg_add "$SERVER_PID"
 
-############################################
-# Wait for first TX activity (t0 close to first send)
-############################################
+
+# TX가 발생할 때까지 대기
 echo "[INFO] Waiting for TX activity on $IFACE ..."
 TX0=$(read_tx_bytes); [[ -z "$TX0" ]] && TX0=0
 while :; do
@@ -392,9 +412,8 @@ while :; do
   fi
 done
 
-############################################
-# Snapshot (start)
-############################################
+
+# 스냅샷(측정 시작 시점)
 declare -A S0_IRQ S0_SIRQ
 for c in "${MON_CPU_ARR[@]}"; do
   line=$(read_proc_stat_line "cpu${c}")
@@ -403,6 +422,7 @@ for c in "${MON_CPU_ARR[@]}"; do
   S0_SIRQ[$c]=$so
 done
 
+# ksoftirqd의 schedstat 실행시간(ns) 스냅샷
 declare -A KSOFT0_NS KSOFT1_NS
 while read -r pid psr comm; do
   [[ "$comm" =~ ^ksoftirqd/([0-9]+)$ ]] || continue
@@ -411,14 +431,14 @@ while read -r pid psr comm; do
   KSOFT0_NS[$n]=$(awk '{print $1}' "/proc/$pid/schedstat" 2>/dev/null || echo 0)
 done < <(ps -eLo pid,psr,comm)
 
+# cgroup cpu.stat 스냅샷 (usec)
 read CG_U0 CG_USER0 CG_SYS0 < <(cg_read_cpu_stat)
 
 TX_START=$(read_tx_bytes)
 T0=$(date +%s%N)
 
-############################################
-# Completion-window wait (count COMPLETE lines)
-############################################
+
+# 완료-윈도우 대기: "COMPLETE" 라인 RUN_REQUESTS개를 셀 때까지
 COMP_SEEN=0
 (
   tail -n0 -F "$LOGFILE" 2>/dev/null & echo $! > "${WORKDIR}/tail.pid"
@@ -435,9 +455,8 @@ T1=$(date +%s%N)
 TX_END=$(read_tx_bytes)
 REQ_WINDOW=$(awk -v a="$T0" -v b="$T1" 'BEGIN{printf "%.3f",(b-a)/1e9}')
 
-############################################
-# Snapshot (end)
-############################################
+
+# 스냅샷(측정 종료 시점)
 declare -A S1_IRQ S1_SIRQ
 for c in "${MON_CPU_ARR[@]}"; do
   line=$(read_proc_stat_line "cpu${c}")
@@ -455,18 +474,16 @@ done < <(ps -eLo pid,psr,comm)
 
 read CG_U1 CG_USER1 CG_SYS1 < <(cg_read_cpu_stat)
 
-############################################
-# Optional: stop server
-############################################
+
+# (옵션) 측정 후 서버 종료
 if [[ "${KILL_SERVER_ON_DONE}" = "1" ]]; then
   kill "$SERVER_PID" 2>/dev/null || true
   wait "$SERVER_PID" 2>/dev/null || true
 fi
 
-############################################
-# Calculations / report
-############################################
-# Kernel time sum (CPUSET ∪ IRQ_CPUSET)
+
+# 계산 및 결과 출력
+# Kernel 시간 합산 (CPUSET ∪ IRQ_CPUSET)
 sum_irq=0
 sum_sirq=0
 for c in "${MON_CPU_ARR[@]}"; do
@@ -474,7 +491,7 @@ for c in "${MON_CPU_ARR[@]}"; do
   sum_sirq=$(awk -v s="$sum_sirq" -v a="${S0_SIRQ[$c]}" -v b="${S1_SIRQ[$c]}" -v hz="$CLK_TCK" 'BEGIN{printf "%.6f", s+ (b-a)/hz}')
 done
 
-# ksoftirqd separated -> inline
+# softirq 중에서 ksoftirqd로 잡힌 부분을 별도로 계산하고, 나머지는 inline으로 계산
 ksum=0
 for n in "${MON_CPU_ARR[@]}"; do
   k0="${KSOFT0_NS[$n]:-0}"
@@ -483,7 +500,7 @@ for n in "${MON_CPU_ARR[@]}"; do
 done
 sirq_inline=$(awk -v so="$sum_sirq" -v kr="$ksum" 'BEGIN{d=so-kr; if(d<0)d=0; printf "%.6f", d;}')
 
-# cgroup stats
+# cgroup 통계 (usec → sec)
 if [[ "${USE_CGROUP}" = "1" ]]; then
   CG_TOT=$(awk -v a="$CG_U0"    -v b="$CG_U1"    'BEGIN{printf "%.6f",(b-a)/1e6}')
   CG_USER=$(awk -v a="$CG_USER0" -v b="$CG_USER1" 'BEGIN{printf "%.6f",(b-a)/1e6}')
@@ -492,28 +509,29 @@ else
   CG_TOT=0; CG_USER=0; CG_SYS=0
 fi
 
-# Reference-only TX delta (denominator is PAYLOAD_BYTES)
+# 참고용 TX 델타 (분모는 payload bytes)
 TX_BYTES=$(( TX_END - TX_START ))
 
+# 총합(중복 카운트 없이 App + softirq + hardirq)
 TOTAL_TRUE=$(awk -v s="$CG_TOT" -v so="$sum_sirq" -v hi="$sum_irq" 'BEGIN{printf "%.6f", s+so+hi}')
 
 echo
-printf "=== CPU Time (Completion Window | CPUSET=%s, IRQ_CPUSET=%s) ===\n" "$CPUSET" "$IRQ_CPUSET"
+printf "=== CPU Time (완료-윈도우 | CPUSET=%s, IRQ_CPUSET=%s) ===\n" "$CPUSET" "$IRQ_CPUSET"
 printf "Payload(bytes)   : %d  (%.3f GiB)\n" "$PAYLOAD_BYTES" "$(gi "$PAYLOAD_BYTES")"
-printf "TX observed      : %d  (%.3f GiB)   # reference only\n" "$TX_BYTES"      "$(gi "$TX_BYTES")"
+printf "TX observed      : %d  (%.3f GiB)   # 참고용\n" "$TX_BYTES"      "$(gi "$TX_BYTES")"
 printf "Window(sec)      : %.3f\n\n" "${REQ_WINDOW:-0}"
 
-printf "# App (cgroup v2, all threads)\n"
+printf "# App (cgroup v2, 전체 스레드)\n"
 printf "cgroup total     : %.3f s   → %.3f s/GB(payload)\n" "$CG_TOT"  "$(S2GB "$CG_TOT" "$PAYLOAD_BYTES")"
 printf "  user/system    : %.3f / %.3f s\n\n" "$CG_USER" "$CG_SYS"
 
-printf "# Kernel (IRQ+softirq on CPUSET ∪ IRQ_CPUSET)\n"
+printf "# Kernel (CPUSET ∪ IRQ_CPUSET에서의 IRQ/softirq)\n"
 printf "softirq(total)   : %.3f s   → %.3f s/GB(payload)\n" "$sum_sirq"    "$(S2GB "$sum_sirq" "$PAYLOAD_BYTES")"
 printf "  ├─ ksoftirqd   : %.3f s   → %.3f s/GB(payload)\n" "$ksum"        "$(S2GB "$ksum"     "$PAYLOAD_BYTES")"
 printf "  └─ inline      : %.3f s   → %.3f s/GB(payload)\n" "$sirq_inline" "$(S2GB "$sirq_inline" "$PAYLOAD_BYTES")"
 printf "IRQ(hard)        : %.3f s   → %.3f s/GB(payload)\n\n" "$sum_irq"     "$(S2GB "$sum_irq"  "$PAYLOAD_BYTES")"
 
-printf "# Combined (no double counting)\n"
+printf "# Combined (중복 카운트 없음)\n"
 printf "TOTAL (App+soft+IRQ): %.3f s  → %.3f s/GB(payload)\n" "$TOTAL_TRUE" "$(S2GB "$TOTAL_TRUE" "$PAYLOAD_BYTES")"
 if [[ -n "${REQ_WINDOW:-}" && "${REQ_WINDOW}" != "0" ]]; then
   printf "CPU vs wall          : %.1f %%  (TOTAL / WINDOW)\n" \
