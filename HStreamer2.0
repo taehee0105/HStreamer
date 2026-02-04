@@ -157,46 +157,53 @@ typedef enum {
     S_CLOSING
 } conn_state_t;
 
-/** 연결 컨텍스트 */
+/** 각 클라이언트 연결 컨텍스트 */
 typedef struct conn {
-    int          fd;
-    SSL         *ssl;
-    conn_state_t st;
-    bool         ktls_on;
+    int          fd;        /** 클라이언트 소켓 파일 디스크립터 */
+    SSL         *ssl;       /** OpenSSL SSL 객체 */
+    conn_state_t st;        /** 현재 상태 (핸드셰이크/읽기/헤더전송/파일전송/종료) */
+    bool         ktls_on;   /** kTLS 활성 여부 */
 
     /* 요청 버퍼 */
-    char   req[REQ_BUFSZ];
-    size_t rq_len;
+    char   req[REQ_BUFSZ];  /** HTTP 요청 문자열 저장 (8KB) */
+    size_t rq_len;          /** 현재까지 읽은 요청 길이 */
 
     /* 응답 헤더 버퍼 */
-    char   hdr[512];
-    size_t hdr_len;
-    size_t hdr_off;
+    char   hdr[512];        /** HTTP 응답 헤더 저장 */
+    size_t hdr_len;         /** 헤더 전체 길이 */
+    size_t hdr_off;         /** 헤더 중 이미 전송한 오프셋 */
 
     /* 파일 송신 */
-    int    ffd;
-    off_t  fsize;
-    off_t  foff;
-    char   disp[NAME_MAX];
+    int    ffd;             /** 전송할 파일의 파일 디스크립터 */
+    off_t  fsize;           /** 파일 전체 크기 */
+    off_t  foff;            /** 파일 중 전송 완료한 오프셋 */
+    char   disp[NAME_MAX];  /** 파일 이름 (URL 디코딩 후) */
 
     /* OpenSSL 경로용 송신 버퍼 */
-    unsigned char *buf;
-    size_t         bufsz;
+    unsigned char *buf;     /** 파일 읽기용 임시 버퍼 */
+    size_t         bufsz;   /** 버퍼 크기 */
 } conn_t;
 
 /** 워커 컨텍스트 */
 typedef struct {
-    pthread_t       th;
-    int             ep;
-    int             qcap;
-    int            *q;
-    int             qh, qt;
-    pthread_mutex_t qmtx;
-    pthread_cond_t  qcv;
-    SSL_CTX        *ctx;
-    const char     *base_dir;
-    int             id;
-    int             cpu;
+    pthread_t       th;     /** 워커 스레드 핸들 */
+    int             ep;     /* epoll 파일 디스크립터 (이벤트 감시용)*/
+    
+    /** 연결 큐 (acceptor → worker 전달용) */
+    int             qcap;   /** 큐 용량 */
+    int            *q;      /** 큐 배열 (클라이언트 fd 저장) */
+    int             qh;     /** 큐 헤드 인덱스 */
+    int             qt;     /** 큐 테일 인덱스 */
+    pthread_mutex_t qmtx;   /** 큐 뮤텍스 */
+    pthread_cond_t  qcv;    /** 큐 조건 변수 */
+    
+    /** 공유 설정 */
+    SSL_CTX        *ctx;    /** SSL 컨텍스트 */
+    const char     *base_dir;   /** 기본 디렉토리 */
+
+    /** 워커 정보 */
+    int             id;     /** 워커 ID */
+    int             cpu;    /** 할당된 CPU 번호 */
 } worker_t;
 
 /** 연결 정리 */
@@ -222,7 +229,7 @@ static void conn_free(conn_t *c) {
     free(c);
 }
 
-/** CPU 핀ning(테스트 실패시 경고만) */
+/** CPU 고정(테스트 실패시 경고만) */
 static void pin_self_to_cpu(int cpu) {
     cpu_set_t set;
     CPU_ZERO(&set);
@@ -243,7 +250,9 @@ static void pin_self_to_cpu(int cpu) {
 static int pick_nth_allowed_cpu(int n) {
     cpu_set_t allowed;
 
+    /** 마스크 조회 */
     if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+        /** 실패 시 전체 CPU 수로 대체 */
         long c = sysconf(_SC_NPROCESSORS_ONLN);
         if (c <= 0) {
             return 0;
@@ -255,6 +264,7 @@ static int pick_nth_allowed_cpu(int n) {
     int cnt = 0;
 
     for (int i = 0; i < CPU_SETSIZE; ++i) {
+        /** 허용된 CPU 목록 작성 */
         if (CPU_ISSET(i, &allowed)) {
             list[cnt++] = i;
         }
@@ -267,11 +277,13 @@ static int pick_nth_allowed_cpu(int n) {
     return list[n % cnt];
 }
 
-/** 비동기 재시도 시 epoll 관심 이벤트 */
+/** epoll 재등록 */
 static void want_events_from_ssl(conn_t *c, uint32_t *events) {
+    /** EPOLLET이 기본값 */
     *events = EPOLLET;
 
     if (c->st == S_HANDSHAKE) {
+        /** 핸드셰이크는 읽기/쓰기 모두 필요 */
         *events |= (EPOLLIN | EPOLLOUT);
         return;
     }
@@ -349,12 +361,15 @@ static int send_nonblock_tls(conn_t *c, const void *buf, size_t len) {
 /** 응답 헤더 플러시 */
 static int flush_hdr(conn_t *c) {
     while (c->hdr_off < c->hdr_len) {
-        int n = send_nonblock_tls(c, c->hdr + c->hdr_off, c->hdr_len - c->hdr_off);
-        if (n > 0) {
+        int n = send_nonblock_tls(c,                        
+                                  c->hdr + c->hdr_off,          /** 남은 헤더 시작 */
+                                  c->hdr_len - c->hdr_off);     /** 남은 헤더 길이 */
+
+        if (n > 0) {                /** 일부 헤더 전송됨 */
             c->hdr_off += (size_t)n;
-        } else if (n == 0) {
+        } else if (n == 0) {        /** EAGAIN: 송신 버퍼 가득참 */
             return 0;
-        } else {
+        } else {                    /** 오류 */
             return -1;
         }
     }
@@ -407,76 +422,77 @@ static int build_and_open_file(conn_t *c) {
 static int send_file_chunk(conn_t *c) {
 #if defined(TLS_MODE_KTLS_SENDFILE)
 # ifdef OPENSSL_KTLS
+
+    /** sendfile */
     if (c->ktls_on) {
         while (c->foff < c->fsize) {
             ssize_t n = sendfile(c->fd, c->ffd, &c->foff, (size_t)(c->fsize - c->foff));
-            if (n > 0) {
+            if (n > 0) {    /** 전송 유지 */
                 continue;
             }
-            if (n == 0) {
+            if (n == 0) {   /** 전송 완료 */
                 break;
             }
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-                return 0;
+                return 0;   /** EAGAIN: 송신 버퍼 가득참 */
             }
-            return -1;
+            return -1;      /** 오류 */
         }
-        return 1;
+        return 1;           /** 전송 완료 */
     }
 # endif
 #endif
-
+    /** OpenSSL SSL_write + 파일 읽기 */
+    /** 버퍼 할당 (최초 1회) */
     if (!c->buf) {
-        long pg = sysconf(_SC_PAGESIZE);
+        long pg = sysconf(_SC_PAGESIZE);    /** 페이지 크기(보통 4KB) */
 
         size_t need = IO_BUFSZ;
         if (need % (size_t)pg) {
-            need += (size_t)pg - (need % (size_t)pg);
+            need += (size_t)pg - (need % (size_t)pg);   /** 페이지 크기 배수로 맞춤 */
         }
 
         if (posix_memalign((void **)&c->buf, (size_t)pg, need) != 0) {
-            c->buf = malloc(need);
+            c->buf = malloc(need);      /** 정렬 실패 시 malloc으로 폴백 */
         }
         c->bufsz = need;
     }
 
+    /** 파일 읽기, 전송 */
     for (;;) {
         ssize_t r = read(c->ffd, c->buf, c->bufsz);
 
         if (r > 0) {
             size_t off = 0;
 
+            /** 읽은 데이터 모두 전송 */
             while (off < (size_t)r) {
                 int n = send_nonblock_tls(c, c->buf + off, (size_t)r - off);
 
                 if (n > 0) {
                     off += (size_t)n;
-                } else if (n == 0) {
-                    /* would block: 파일 오프셋 되돌리기 */
+                } else if (n == 0) {       /** 송신 버퍼 부족: 파일 오프셋 되돌리기 */
                     lseek(c->ffd, (off - (size_t)r), SEEK_CUR);
                     return 0;
-                } else {
+                } else {                   /** 오류 */
                     return -1;
                 }
             }
 
             c->foff += r;
 
-        } else if (r == 0) {
+        } else if (r == 0) {    /** EOF: 파일 전송 완료 */
             return 1;
 
         } else {
             if (errno == EINTR) {
-                continue;
+                continue;   /** 인터럽트 시 재시도 */
             }
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return 0;
+                return 0;   /** 송신 버퍼 부족 */
             }
             return -1;
         }
-
-        /* 공정성: 웨이크마다 한 덩어리 */
-        // break;
     }
 
     return 0;
@@ -500,14 +516,16 @@ static void send_404(conn_t *c) {
     (void)send_nonblock_tls(c, body, strlen(body));
 }
 
-/** 이벤트 핸들러: 상태머신 전진 + would-block 재무장 */
+/** 이벤트 핸들러 */
 static void handle_conn_event(worker_t *w, conn_t *c, uint32_t ev) {
+    /** 클라이언트의 연결 종료(EPOLLHUP)나 소켓 에러(EPOLLERR) 상태 처리 */
     if (ev & (EPOLLHUP | EPOLLERR)) {
         c->st = S_CLOSING;
     }
 
     for (;;) {
         if (c->st == S_HANDSHAKE) {
+            /** TLS 핸드셰이크 */
             int r = SSL_accept(c->ssl);
 
             if (r == 1) {
@@ -520,15 +538,21 @@ static void handle_conn_event(worker_t *w, conn_t *c, uint32_t ev) {
                 c->st = S_READ_REQ;
 
             } else {
+                /** TLS 핸드셰이크가 진행 중이거나 에러 */
                 int e = SSL_get_error(c->ssl, r);
 
+                /** 수신 데이터가 부족하거나 핸드셰이크 송신 버퍼가 부족할 때*/
                 if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
                     uint32_t ne;
+
+                    /** epoll 이벤트 재등록 */
                     want_events_from_ssl(c, &ne);
                     mod_fd_et(w->ep, c->fd, ne, c);
-                    return;
+
+                    return;     /** epoll_wait으로 대기 */
                 }
 
+                /** 핸드셰이크 실패 시 */
                 fprintf(stdout, "ERROR handshake fd=%d\n", c->fd);
                 fflush(stdout);
 
@@ -536,12 +560,14 @@ static void handle_conn_event(worker_t *w, conn_t *c, uint32_t ev) {
             }
         }
 
+
         if (c->st == S_READ_REQ) {
+            /** 요청을 다 읽을 때까지 */
             for (;;) {
                 ssize_t n = SSL_read(
                     c->ssl,
-                    c->req + c->rq_len,
-                    sizeof(c->req) - 1 - c->rq_len
+                    c->req + c->rq_len,           /** 이전에 읽은 위치 다음부터 */
+                    sizeof(c->req) - 1 - c->rq_len  /** 남은 버퍼 크기 */
                 );
 
                 if (n > 0) {
@@ -550,14 +576,18 @@ static void handle_conn_event(worker_t *w, conn_t *c, uint32_t ev) {
                 } else {
                     int e = SSL_get_error(c->ssl, (int)n);
 
+                    /** 수신 데이터가 부족 */
                     if (e == SSL_ERROR_WANT_READ) {
                         mod_fd_et(w->ep, c->fd, EPOLLIN, c);
-                        return;
+                        return;     /** epoll_wait으로 대기 */
                     }
+                    /** TLS 레코드 송신 버퍼 부족 */
                     if (e == SSL_ERROR_WANT_WRITE) {
                         mod_fd_et(w->ep, c->fd, EPOLLOUT, c);
-                        return;
+                        return;     /** epoll_wait으로 대기 */
                     }
+
+                    /** 클라이언트의 연결 종료나 에러 */
                     if (n == 0) {
                         c->st = S_CLOSING;
                         break;
@@ -570,7 +600,7 @@ static void handle_conn_event(worker_t *w, conn_t *c, uint32_t ev) {
                     break;
                 }
 
-                /* 간단 파싱 */
+                /** HTTP 요청 파싱 */
                 char method[8]  = { 0 };
                 char path[1024] = { 0 };
                 char proto[16]  = { 0 };
@@ -600,13 +630,14 @@ static void handle_conn_event(worker_t *w, conn_t *c, uint32_t ev) {
                         break;
                     }
 
+                    /** 파일 열고 헤더 생성 */
                     if (build_and_open_file(c) < 0) {
                         send_404(c);
                         c->st = S_CLOSING;
                         break;
                     }
 
-                    /* 어떤 파일을 보낼지 로그 */
+                    /** 어떤 파일을 보낼지 로깅 */
                     fprintf(stdout,
                             "REQUEST fd=%d path=\"%s\" size=%jd\n",
                             c->fd, c->disp, (intmax_t)c->fsize);
@@ -624,6 +655,7 @@ static void handle_conn_event(worker_t *w, conn_t *c, uint32_t ev) {
             }
         }
 
+
         if (c->st == S_SEND_HDR) {
             int r = flush_hdr(c);
 
@@ -632,32 +664,34 @@ static void handle_conn_event(worker_t *w, conn_t *c, uint32_t ev) {
                 fflush(stdout);
                 c->st = S_CLOSING;
 
-            } else if (r == 0) {
+            } else if (r == 0) {        /** 송신 버퍼 부족 */
                 mod_fd_et(w->ep, c->fd, EPOLLOUT, c);
                 return;
 
-            } else {
+            } else {                    /** 헤더 전송 완료 */
                 c->st = S_SEND_FILE;
             }
         }
 
+
         if (c->st == S_SEND_FILE) {
             int r = send_file_chunk(c);
 
-            if (r < 0) {
+            if (r < 0) {                /** 파일 전송 오류 */
                 fprintf(stdout, "ERROR body fd=%d\n", c->fd);
                 fflush(stdout);
                 c->st = S_CLOSING;
 
-            } else if (r == 0) {
+            } else if (r == 0) {        /** 송신 버퍼 부족 */
                 mod_fd_et(w->ep, c->fd, EPOLLOUT, c);
                 return;
 
-            } else {
+            } else {                    /** 파일 전송 완료 */
+                /** CORK 옵션 해제 */
                 int cork = 0;
                 setsockopt(c->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
 
-                /* 전송 완료 시점: 정확한 바이트 = 파일 크기 */
+                /** 전송 완료 시점: 정확한 바이트 = 파일 크기 */
                 fprintf(stdout,
                         "COMPLETE fd=%d path=\"%s\" bytes=%jd\n",
                         c->fd, c->disp, (intmax_t)c->fsize);
@@ -678,37 +712,51 @@ static void handle_conn_event(worker_t *w, conn_t *c, uint32_t ev) {
 static void *worker_main(void *arg) {
     worker_t *w = (worker_t *)arg;
 
-    pin_self_to_cpu(w->cpu);
+    pin_self_to_cpu(w->cpu);    /** 워커 스레드 CPU 고정 */
     fprintf(stderr, "[INFO] worker#%d pinned to CPU %d\n", w->id, w->cpu);
 
     struct epoll_event evs[MAX_EVENTS];
 
     while (!g_stop) {
-        /* 1) acceptor → worker 큐 수신 */
+
+        /** 1) acceptor → worker 큐 수신 */
         pthread_mutex_lock(&w->qmtx);
 
+        
+        /** 큐에서 모든 클라이언트 fd 추출 */
         while (w->qh != w->qt) {
             int cfd = w->q[w->qh];
+
+            /** 가득차면 오래된 fd 드롭 */
             w->qh = (w->qh + 1) % w->qcap;
 
             pthread_mutex_unlock(&w->qmtx);
 
+            /** 논블로킹 설정 */
             set_nonblock(cfd);
 
-            /* [SOCKET TUNING — 큰 덩어리 배출 강제] */
+            /** 
+             * CORK 설정
+             *  - 약 1460바이트 (MTU)
+             *  - 200ms 타임아웃
+             */
             int cork = 1;
             (void)setsockopt(cfd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
 
+            /** 송신 버퍼 크기 설정 */
             int sndbuf = 4 * 1024 * 1024; 
             (void)setsockopt(cfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
 #ifdef TCP_NOTSENT_LOWAT
+            /** 송신되지 않은 데이터 임계치 설정 */
             int lowat = 2 * 1024 * 1024; 
             (void)setsockopt(cfd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat, sizeof(lowat));
 #endif
-            /* [END SOCKET TUNING] */
 
-            /* [VERIFY — 실제 적용된 값 로깅] */
+            /** 
+             * VERIFY 
+             *  - 소켓 옵션 적용 후 검증 단계
+             */
             int v;
             socklen_t l = sizeof(v);
 
@@ -723,11 +771,13 @@ static void *worker_main(void *arg) {
 #endif
             fflush(stdout);
 
+            /** 연결 구조체 할당 및 초기화 */
             conn_t *c = (conn_t *)calloc(1, sizeof(*c));
             c->fd  = cfd;
             c->ffd = -1;
             c->st  = S_HANDSHAKE;
 
+            /** SSL 세션 객체 생성 */
             c->ssl = SSL_new(w->ctx);
             if (!c->ssl) {
                 close(cfd);
@@ -737,10 +787,14 @@ static void *worker_main(void *arg) {
                 continue;
             }
 
+            /** SSL 세션 객체와 소켓 연결 */
             SSL_set_fd(c->ssl, cfd);
             SSL_set_ex_data(c->ssl, g_ssl_ex_base_dir_idx, (void *)w->base_dir);
 
-            uint32_t ev = EPOLLIN | EPOLLOUT; /* 핸드셰이크 IN/OUT 모두 */
+
+            /** epoll 이벤트 등록 */
+            uint32_t ev = EPOLLIN | EPOLLOUT;       /** TLS 핸드셰이크는 읽기/쓰기 모두 필요 */
+            /** EPOLLET(edge-triggered) 등록 */
             if (add_fd_et(w->ep, cfd, ev, c) < 0) {
                 conn_free(c);
             }
@@ -750,8 +804,10 @@ static void *worker_main(void *arg) {
 
         pthread_mutex_unlock(&w->qmtx);
 
-        /* 2) 이벤트 처리 */
+
+        /** 2) 이벤트 처리 */
         int n = epoll_wait(w->ep, evs, MAX_EVENTS, 200);
+        /** 인터럽트가 아닌 epoll_wait의 에러이면 워커 종료 */
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
@@ -759,6 +815,7 @@ static void *worker_main(void *arg) {
             break;
         }
 
+        /** 이벤트 순회 */
         for (int i = 0; i < n; ++i) {
             conn_t *c = (conn_t *)evs[i].data.ptr;
             if (!c) {
@@ -771,23 +828,28 @@ static void *worker_main(void *arg) {
     return NULL;
 }
 
+
 /** 큐 삽입 */
 static void q_push(worker_t *w, int fd) {
     pthread_mutex_lock(&w->qmtx);
 
-    int nxt = (w->qt + 1) % w->qcap;
+    int nxt = (w->qt + 1) % w->qcap;    /** 순환 큐 */
+
+    /** 가득차면 오래된 fd 드롭 */
     if (nxt == w->qh) {
-        w->qh = (w->qh + 1) % w->qcap; /* 가득차면 drop oldest */
+        w->qh = (w->qh + 1) % w->qcap; 
     }
 
     w->q[w->qt] = fd;
     w->qt = nxt;
 
     pthread_mutex_unlock(&w->qmtx);
+    /** 대기 중인 워커 깨우기 */
     pthread_cond_signal(&w->qcv);
 }
 
-/** 리스너 */
+
+/** socket, bind, listen, nonblock 설정 */
 static int make_listen(uint16_t port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -814,13 +876,18 @@ static int make_listen(uint16_t port) {
         die("listen");
     }
 
+    /** 논블로킹 설정 */
     set_nonblock(fd);
     return fd;
 }
 
 /** main */
 int main(int argc, char **argv) {
-    /* stdout: line-buffered → tail -f 로 바로 보이게 */
+    /**
+     * stdout: line-buffered 
+     *   - \n이 있으면 자동 플러시
+     *   - fflush(stdout)와 동일
+     */
     setvbuf(stdout, NULL, _IOLBF, 0);
 
     if (argc < 5) {
@@ -835,6 +902,7 @@ int main(int argc, char **argv) {
     const char *key    = argv[3];
     const char *base_dir = argv[4];
 
+    /** 워커 인자 미지정 시 온라인 CPU 수로 설정 */
     int workers = (argc >= 6) ? atoi(argv[5]) : (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (workers <= 0) {
         workers = 1;
@@ -843,14 +911,20 @@ int main(int argc, char **argv) {
         workers = MAX_WORKERS;
     }
 
+    /**
+     * SIGINT/SIGTERM 핸들러 설정
+     *  - g_stop 플래그 설정으로 main/워커 루프 종료
+     */
     struct sigaction sa = { 0 };
     sa.sa_handler = on_sigint;
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
+    /** OpenSSL 초기화 */
     SSL_load_error_strings();
     OpenSSL_add_ssl_algorithms();
 
+    /** SSL_CTX 생성 */
     const SSL_METHOD *m = TLS_server_method();
     SSL_CTX *ctx = SSL_CTX_new(m);
     if (!ctx) {
@@ -865,7 +939,7 @@ int main(int argc, char **argv) {
 # endif
 #endif
 
-    /*
+    /**
      * HW kTLS 오프로딩을 위해 TLS 1.2 + ECDHE-RSA-AES128-GCM-SHA256 강제
      * TLS 1.2에서는 set_ciphersuites가 아니라 set_cipher_list 를 써야 함
      */
@@ -888,32 +962,43 @@ int main(int argc, char **argv) {
         die_ssl("check key");
     }
 
+    /**
+     * SSL ex_data index 생성 
+     *   - 워커별 base_dir 전달용
+     *   - SSL_set_ex_data / SSL_get_ex_data 사용
+     */
     g_ssl_ex_base_dir_idx = SSL_get_ex_new_index(0, (void *)"base_dir", NULL, NULL, NULL);
 
+
+    /** listen 소켓 설정 */
     int lfd = make_listen(port);
 
+
+    /** 워커 스레드 생성 */
     worker_t *ws = calloc((size_t)workers, sizeof(worker_t));
+    /** 워커 별 CPU 할당 */
     for (int i = 0; i < workers; ++i) {
         ws[i].cpu = pick_nth_allowed_cpu(i);
     }
 
     for (int i = 0; i < workers; ++i) {
-        ws[i].ep = epoll_create1(EPOLL_CLOEXEC);
+        ws[i].ep = epoll_create1(EPOLL_CLOEXEC);            /** epoll 인스턴스 생성 후 FD 등록 */
         if (ws[i].ep < 0) {
             die("epoll_create1");
         }
 
-        ws[i].qcap = 4096;
-        ws[i].q = calloc((size_t)ws[i].qcap, sizeof(int));
-        ws[i].qh = 0;
-        ws[i].qt = 0;
+        ws[i].qcap = 4096;                                   /** 큐 용량 */
+        ws[i].q = calloc((size_t)ws[i].qcap, sizeof(int));   /** 큐 배열 */
+        ws[i].qh = 0;                                        /** 큐 헤드 인덱스 */
+        ws[i].qt = 0;                                        /** 큐 테일 인덱스 */
 
-        pthread_mutex_init(&ws[i].qmtx, NULL);
-        pthread_cond_init(&ws[i].qcv, NULL);
+        pthread_mutex_init(&ws[i].qmtx, NULL);          /** 큐 뮤텍스 초기화 */
+        pthread_cond_init(&ws[i].qcv, NULL);            /** 큐 조건 변수 초기화 */
 
-        ws[i].ctx = ctx;
-        ws[i].base_dir = base_dir;
-        ws[i].id = i;
+        ws[i].ctx = ctx;                          /** SSL_CTX 공유 */    
+        ws[i].base_dir = base_dir;                /** 기본 디렉토리 공유 */
+        ws[i].id = i;                             /** 워커 ID */ 
+
 
         if (pthread_create(&ws[i].th, NULL, worker_main, &ws[i]) != 0) {
             die("pthread_create");
@@ -924,7 +1009,8 @@ int main(int argc, char **argv) {
             "[INFO] mode=%s listen=https://0.0.0.0:%u workers=%d (Ctrl-C to stop)\n",
             MODE_NAME, port, workers);
 
-    int rr = 0; /* 라운드로빈 */
+    int rr = 0;         /** 라운드로빈 */
+
     while (!g_stop) {
         struct sockaddr_in addr;
         socklen_t alen = sizeof(addr);
@@ -932,7 +1018,7 @@ int main(int argc, char **argv) {
         int cfd = accept4(lfd, (struct sockaddr *)&addr, &alen, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (cfd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                usleep(1000);
+                usleep(1000);   /** 폴링 최적화 */
                 continue;
             }
             if (errno == EINTR) {
@@ -941,8 +1027,11 @@ int main(int argc, char **argv) {
             break;
         }
 
+        /** 라운드로빈으로 워커에 연결 전달 */
         q_push(&ws[rr], cfd);
         rr++;
+
+        /** 순환 */
         if (rr == workers) {
             rr = 0;
         }
