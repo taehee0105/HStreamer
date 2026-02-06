@@ -27,7 +27,6 @@ BASEDIR=${BASEDIR:-/data}
 PORT=${PORT:-4613}
 WORKERS=${WORKERS:-}
 PIN_NUMA=${PIN_NUMA:-}
-PIN_KSOFTIRQD=${PIN_KSOFTIRQD:-1}
 SET_RSS=${SET_RSS:-1}
 RSS_QUEUES=${RSS_QUEUES:-}
 SET_RPS_XPS=${SET_RPS_XPS:-1}
@@ -50,27 +49,27 @@ SYSBK="${WORKDIR}/sys_backup"
 CG="/sys/fs/cgroup/ktls_xfer_${TS}"
 mkdir -p "${WORKDIR}" "${SYSBK}"
 
-# /proc/stat의 jiffies → 초 변환에 필요한 HZ 값
-CLK_TCK=$(getconf CLK_TCK)
 
-# GiB 변환 상수
-BYTES_PER_GIB=$((1024*1024*1024))
-
+# ============================================================================
+# CPU 관련 함수
+# ============================================================================
 
 # CPU 스펙("0-3,8,10-11")을 실제 CPU 번호 목록으로 변환
+# 한 줄씩 출력
 to_cpulist() { awk -v cpuspec="$1" '
   BEGIN{
-    n=split(cpuspec,a,",");
-    for(i=1;i<=n;i++){
+    n = split(cpuspec, a, ",");
+    for(i = 1; i <= n; i++){
       if(a[i] ~ /-/){
-        split(a[i],b,"-");
-        for(c=b[1];c<=b[2];c++) print c;
+        split(a[i], b, "-");
+        for(c = b[1]; c <= b[2]; c++) print c;
       } else print a[i];
     }
   }'
 }
 
 # CPU 스펙 문자열 형식 검증
+# 숫자/콤마/-만으로 구성되었는지 확인
 validate_cpuspec_or_die() {
   local spec="$1" name="$2"
   if [[ ! "$spec" =~ ^[0-9,-]+$ ]]; then
@@ -80,53 +79,82 @@ validate_cpuspec_or_die() {
 }
 
 # CPU 스펙 → CSV (예: "0-3,8" → "0,1,2,3,8")
+# to_cpulist() 결과를 ,로 연결
+# 마지막 ,는 제거
 cpuspec_to_listcsv() {
   local spec="$1"
   to_cpulist "$spec" | tr '\n' ',' | sed 's/,$//'
 }
 
-# "1G/512M/1024" 같은 size를 바이트로 변환
-parse_size_bytes(){ python3 - "$1" <<'PY'
-import sys
-s=sys.argv[1].strip().upper()
-mul={'K':1024,'M':1024**2,'G':1024**3,'T':1024**4}
-print(int(float(s[:-1])*mul[s[-1]]) if s[-1] in mul else int(s))
-PY
-}
-
-# ethtool 존재 여부
-have_ethtool(){ command -v ethtool >/dev/null 2>&1; }
-
 # CPU 리스트 CSV(예:"0,2,3")를 smp_affinity 등에 쓰는 hex 마스크로 변환
+# cpus: 콤마 구분 CPU 번호 목록
 mask_from_cpulist(){ python3 - "$1" <<'PY'
 import sys
-cpus=[int(x) for x in sys.argv[1].split(',') if x!='']
-m=0
+cpus = [int(x) for x in sys.argv[1].split(',') if x!='']
+m = 0
 for c in cpus: m |= (1<<c)
 print("{:x}".format(m))
 PY
 }
 
-# /proc/stat에서 특정 cpu 라인(cpu0/cpu1 등) 한 줄만 읽기
-read_proc_stat_line(){ awk -v id="$1" '$1==id{print; exit}' /proc/stat; }
 
-# /proc/stat cpu 라인에서 irq(7번째), softirq(8번째) 필드 추출
-extract_irq_soft(){ awk '{print $(7), $(8)}' <<<"$1"; }
+# ============================================================================
+# 크기/포맷 변환 함수
+# ============================================================================
+
+# /proc/stat의 jiffies → 초 변환에 필요한 HZ 값
+CLK_TCK=$(getconf CLK_TCK)
+
+# GiB 변환 상수
+BYTES_PER_GIB=$((1024*1024*1024))
+
+# "1G/512M/1024" 같은 size를 바이트로 변환
+# 입력 문자열을 공백 제거 후 대문자로 변환
+parse_size_bytes(){ python3 - "$1" <<'PY'
+import sys
+s = sys.argv[1].strip().upper()
+mul = {'K':1024,'M':1024**2,'G':1024**3,'T':1024**4}
+print(int(float(s[:-1]) * mul[s[-1]]) if s[-1] in mul else int(s))
+PY
+}
 
 # 바이트를 GiB로 출력(소수점 3자리)
-gi(){ awk -v B="$1" -v G="$BYTES_PER_GIB" 'BEGIN{printf "%.3f",(B>0)?B/G:0.0}'; }
+gi(){ awk -v B="$1" -v G="$BYTES_PER_GIB" 'BEGIN{printf "%.3f", (B > 0) ? B/G : 0.0}'; }
 
 # seconds를 payload(바이트) 기준 s/GB로 변환
-S2GB(){ awk -v s="$1" -v B="$2" -v GiB="$BYTES_PER_GIB" 'BEGIN{if(B>0){printf "%.6f", s/(B/GiB)}else{printf "0.000000"} }'; }
+S2GB(){ awk -v s="$1" -v B="$2" -v GiB="$BYTES_PER_GIB" 'BEGIN{if(B > 0){printf "%.6f", s/(B/GiB)} else{printf "0.000000"} }'; }
 
+
+# ============================================================================
+# /proc 시스템 정보 함수
+# ============================================================================
+
+# /proc/stat에서 첫 번째 열에서 특정 cpu 라인(cpu0/cpu1 등) 한 줄만 읽기
+read_proc_stat_line(){ awk -v id="$1" '$1==id{print; exit}' /proc/stat; }
+
+# /proc/stat 특정 cpu 라인(<<<"$1")에서 irq(7번째), softirq(8번째) 필드 추출
+extract_irq_soft(){ awk '{print $(7), $(8)}' <<<"$1"; }
+
+# IFACE TX 바이트 읽기 (참고용)
+# 첫 번째 열이 IFACE:인 라인에서 10번째 필드 추출(TX 바이트)
+read_tx_bytes(){ awk -v dev="$IFACE" '$1==dev":"{print $10}' /proc/net/dev 2>/dev/null | tr -d ' '; }
+
+
+# ============================================================================
+# 설정 파싱 및 변수 초기화
+# ============================================================================
 
 # CPUSET / IRQ_CPUSET 파싱
 validate_cpuspec_or_die "$CPUSET" "CPUSET"
 CPULIST=$(cpuspec_to_listcsv "$CPUSET")
+# , -> 공백으로 변환 후 배열로 저장
 CPU_ARR=($(echo "$CPULIST" | tr ',' ' '))
+# 배열 요소 개수 반환(#)
 NCPU=${#CPU_ARR[@]}
 
+
 # IRQ CPUSET (기본값: CPUSET)
+# CPUSET과 동일한 방식으로 파싱
 IRQ_CPUSET=${IRQ_CPUSET:-$CPUSET}
 validate_cpuspec_or_die "$IRQ_CPUSET" "IRQ_CPUSET"
 IRQ_CPULIST=$(cpuspec_to_listcsv "$IRQ_CPUSET")
@@ -134,6 +162,9 @@ IRQ_CPU_ARR=($(echo "$IRQ_CPULIST" | tr ',' ' '))
 NIRQCPU=${#IRQ_CPU_ARR[@]}
 
 # softirq/IRQ 측정 코어 집합 = CPUSET ∪ IRQ_CPUSET
+# awk로 중복 제거 후 정렬
+#   awk는 모든 행을 순회함, $n은 열을 의미
+# \n -> , 변환 후 마지막 , 제거
 MON_CPULIST=$(
   printf "%s\n%s\n" "$CPULIST" "$IRQ_CPULIST" \
   | tr ',' '\n' \
@@ -146,6 +177,7 @@ MON_CPU_ARR=($(echo "$MON_CPULIST" | tr ',' ' '))
 NMONCPU=${#MON_CPU_ARR[@]}
 
 # WORKERS/RSS_QUEUES 기본값: CPUSET 코어 수로 자동 설정
+# -z: 길이가 0인 경우 참
 [[ -z "$WORKERS" ]] && WORKERS=$NCPU
 [[ -z "${RSS_QUEUES}" ]] && RSS_QUEUES=$NCPU
 
@@ -154,48 +186,78 @@ FILE_BYTES=$(parse_size_bytes "$FILE_TO_GET")
 PAYLOAD_BYTES=$(( FILE_BYTES * RUN_REQUESTS ))
 
 
-# cgroup v2 관련 헬퍼
+# ============================================================================
+# cgroup v2 관련 함수
+# ============================================================================
+
+# [[조건]] && - 참일 때만 명령 실행
+# [[조건]] || - 거짓일 때만 명령 실행
 cg_create(){ [[ "${USE_CGROUP}" = "1" ]] || return 0; mkdir -p "$CG"; }
+
+# pid를 cgroup에 추가
 cg_add(){ [[ "${USE_CGROUP}" = "1" ]] || return 0; echo "$1" > "$CG/cgroup.procs" 2>/dev/null || true; }
 
 # cgroup cpu.stat에서 usage/user/system(usec)을 읽어오기
+# a[$1]=$2 -> 첫 번째 열을 키로, 두 번째 열을 값으로 배열에 저장
 cg_read_cpu_stat(){
   [[ "${USE_CGROUP}" = "1" ]] || { echo "0 0 0"; return 0; }
   awk '{a[$1]=$2} END{print a["usage_usec"]+0, a["user_usec"]+0, a["system_usec"]+0}' "$CG/cpu.stat"
 }
 
-# cgroup 정리(존재하면 삭제)
 cg_cleanup(){ [[ "${USE_CGROUP}" = "1" ]] || return 0; rmdir "$CG" 2>/dev/null || true; }
 
 
-# irqbalance 제어
+# ============================================================================
+# irqbalance 제어 함수
+# ============================================================================
+
+# || true -> 실패해도 무시
 stop_irqbalance(){ systemctl stop irqbalance 2>/dev/null || true; echo "[INFO] irqbalance stopped"; }
+
 restore_irqbalance(){ systemctl start irqbalance 2>/dev/null || true; echo "[CLEANUP] irqbalance started"; }
 
 
-# RSS 큐 수 조정 (ethtool -L)
+# ============================================================================
+# ethtool 및 RSS 큐 관리 함수
+# ============================================================================
+
+# ethtool 존재 여부
+have_ethtool(){ command -v ethtool >/dev/null 2>&1; }
+
+# /Pre-set maximums: 줄을 만나면 f=1로 설정
+# f가 1인 상태에서 Combined: 줄을 만나면 두 번째 열 출력
 get_preset_max(){
   have_ethtool || { echo ""; return 0; }
   ethtool -l "$IFACE" 2>/dev/null | awk '/Pre-set maximums:/{f=1;next} f&&$1=="Combined:"{print $2;exit}'
 }
+
+# 현재 큐 수 읽기
+# get_preset_max()와 같은 구조
 get_current_combined(){
   have_ethtool || { echo ""; return 0; }
   ethtool -l "$IFACE" 2>/dev/null | awk '/Current hardware settings:/{f=1;next} f&&$1=="Combined:"{print $2;exit}'
 }
+
+# 큐 수가 want와 같은지 확인 (참: 0, 거짓: 1)
 verify_queues(){ local want="$1"; local cur="$(get_current_combined || true)"; [[ "$cur" == "$want" ]]; }
 
 # 큐 수를 want로 설정(원래 preset 최대값은 백업)
 shrink_to_n(){
   local want="$1"
-  local preset
-  local orig="${SYSBK}/preset_queues"
+  local preset                          # 기존 preset 최대값
+  local orig="${SYSBK}/preset_queues"   # 원래 값 백업 경로
 
-  preset="$(get_preset_max || true)"
+  preset="$(get_preset_max || true)"    # 실패해도 무시
+
+  # preset가 있다면, 원래 값 백업
+  # -n: 문자열 길이가 0이 아닌 경우 참
   [[ -n "$preset" ]] && echo "$preset" > "$orig" || echo "unknown" > "$orig"
 
   if have_ethtool; then
     ethtool -L "$IFACE" combined "$want" >/dev/null 2>&1 || true
-    sleep 0.2
+    sleep 0.2   # 약간 대기
+    
+    # 최신화된 값 확인
     if verify_queues "$want"; then
       echo "[INFO] ${IFACE}: queues set to ${want}"
     else
@@ -207,19 +269,26 @@ shrink_to_n(){
 # 큐 수를 원래 값으로 복구(가능한 경우)
 restore_queues(){
   local orig="${SYSBK}/preset_queues"
+
+  # -f: 파일이 존재하는지 확인
   [[ -f "$orig" ]] || { echo "[CLEANUP] no queue backup"; return 0; }
 
-  local target
+  local target    # 복구 목표 값
   target="$(cat "$orig")"
+
+  # "unknown"이거나 빈 문자열이면 복구하지 않음
   [[ "$target" == "unknown" || -z "$target" ]] && { echo "[CLEANUP] queue restore skipped"; return 0; }
 
-  local cur
+  local cur   # 현재 값
   cur="$(get_current_combined || true)"
+
+  # 현재 값과 복구 목표 값이 같으면 복구하지 않음
   [[ "$cur" == "$target" ]] && { echo "[CLEANUP] queues already ${target}"; return 0; }
 
   have_ethtool && ethtool -L "$IFACE" combined "$target" >/dev/null 2>&1 || true
-  sleep 0.2
+  sleep 0.2   # 약간 대기
 
+  # 복원된 값 확인
   if verify_queues "$target"; then
     echo "[CLEANUP] queues restored: ${cur:-?} -> ${target}"
   else
@@ -227,24 +296,36 @@ restore_queues(){
   fi
 }
 
-# RPS/XPS 설정/복구
-disable_rps_xps(){
+
+# ============================================================================
+# RPS/XPS 관리 함수
+# ============================================================================
+
+# RPS/XPS 설정/백업
+set_rps_xps(){
   local qdir="/sys/class/net/${IFACE}/queues"
+  # -d: 디렉터리가 존재하는지 확인
   [[ -d "$qdir" ]] || return 0
 
+  # RPS/XPS 백업 디렉터리 생성
   mkdir -p "${SYSBK}/rps" "${SYSBK}/xps"
 
-  # IRQ_CPUSET에 해당하는 CPU 마스크로 RPS/XPS 설정
-  local mask_hex
+  # IRQ_CPUSET에 해당하는 CPU 마스크(16진수)로 RPS/XPS 설정
+  local mask_hex 
   mask_hex=$(mask_from_cpulist "$IRQ_CPULIST")
 
+  # RX 큐의 rps_cpus 백업
   for f in "$qdir"/rx-*/rps_cpus; do
     [[ -f "$f" ]] && {
+      # basename: 파일명만 추출
+      # dirname: 디렉터리명만 추출
+      # 디렉터리명에서 파일명 추출하여 백업 경로 생성
       cp "$f" "${SYSBK}/rps/$(basename "$(dirname "$f")")" 2>/dev/null || true
       echo "$mask_hex" > "$f" 2>/dev/null || true
     }
   done
 
+  # TX 큐의 xps_cpus 백업
   for f in "$qdir"/tx-*/xps_cpus; do
     [[ -f "$f" ]] && {
       cp "$f" "${SYSBK}/xps/$(basename "$(dirname "$f")")" 2>/dev/null || true
@@ -261,7 +342,9 @@ restore_rps_xps(){
 
   if [[ -d "${SYSBK}/rps" ]]; then
     for f in "${SYSBK}"/rps/*; do
-      local q; q=$(basename "$f")
+      local q;  # 큐 디렉터리명
+
+      q=$(basename "$f")
       [[ -f "$qdir/$q/rps_cpus" ]] && cat "$f" > "$qdir/$q/rps_cpus" || true
     done
     echo "[CLEANUP] RPS restored"
@@ -269,24 +352,54 @@ restore_rps_xps(){
 
   if [[ -d "${SYSBK}/xps" ]]; then
     for f in "${SYSBK}"/xps/*; do
-      local q; q=$(basename "$f")
+      local q;  # 큐 디렉터리명
+
+      q=$(basename "$f")
       [[ -f "$qdir/$q/xps_cpus" ]] && cat "$f" > "$qdir/$q/xps_cpus" || true
     done
     echo "[CLEANUP] XPS restored"
   fi
 }
 
-# IRQ affinity 설정/복구 (mlx5_comp 중심)
+
+# ============================================================================
+# IRQ affinity 관리 함수 (mlx5_comp 중심)
+# ============================================================================
+
+# PCI BDF 주소 추출 (0000:00:00.0 형식)
 pci_bdf_of_iface() {
+  # readlink: 심볼릭 링크 대상 경로 출력
+  # -f: 절대 경로로 출력
+  # awk -F/: 구분자를 /로 설정
+  # $NF: 마지막 필드
   readlink -f "/sys/class/net/${IFACE}/device" | awk -F/ '{print $NF}'
 }
 
 # /proc/interrupts에서 mlx5_comp IRQ를 수집(RSS_QUEUES 개수만큼)
 collect_irqs() {
-  local bdf
+  local bdf   # PCI BDF 주소
   bdf="$(pci_bdf_of_iface)"
+
+  # -n: 문자열 길이가 0이 아닌 경우 참
+  # [[조건]] || - 거짓일 때만 명령 실행
   [[ -n "$bdf" ]] || return 0
 
+
+
+  # /proc/interrupts 파일 형식 예시
+  # IRQ 번호     CPU0       CPU1       CPU2  ...    IRQ 컨트롤러 타입     PCI 디바이스        주소 IRQ 이름/설명
+  #   0:         23          0          0             IO-APIC             2-edge              timer
+  #  16:          0          0          0             IO-APIC             16-fasteoi          i801_smbus
+  # 145:    1234567     234567     345678             IR-PCI-MSI          0000:a1:00.0-0      mlx5_comp0
+  # 146:    2345678     345678     456789             IR-PCI-MSI          0000:a1:00.0-1      mlx5_comp1
+
+  # [ 0-9]+: 공백 또는 숫자 하나 이상 + 콜론(:)
+  # gsub(): 문자열 치환 함수
+  #   gsub(":", "", $1) -> 첫 번째 필드에서 콜론 제거 (145: -> 145)
+  # index(): 문자열 포함 여부 확인 함수
+  #   index($0, pat) -> 전체 줄($0)에 pat가 포함되어 있는지 확인
+  #   index($0, "mlx5_comp") -> mlx5_comp 문자열 포함 여부 확인
+  # head -n "${RSS_QUEUES:-1}" -> RSS_QUEUES 개수 만큼 출력
   awk -v pat="$bdf" '
     /^[ 0-9]+:/ {
       gsub(":", "", $1); irq=$1
@@ -298,88 +411,75 @@ collect_irqs() {
 
 # 수집한 IRQ를 IRQ_CPUSET 내부에서 라운드로빈으로 배치
 affine_irqs_round_robin(){
-  local irqs=($(collect_irqs))
+  local irqs=($(collect_irqs))    # mlx5_comp에 대한 IRQ 목록 배열
+
+  # 배열 길이가 0이면 종료
+  # (()): 산술 평가 (0이면 거짓)
   ((${#irqs[@]})) || { echo "[INFO] No IRQs for ${IFACE}"; return 0; }
 
-  local idx=0
+  local idx=0                  # 라운드-로빈 인덱스
   for irq in "${irqs[@]}"; do
+    # IRQ affinity 설정 파일이 없으면 건너뜀
     [[ -f "/proc/irq/${irq}/smp_affinity_list" ]] || continue
 
+    # 원래 affinity 값을 백업 파일로 저장
     cat "/proc/irq/${irq}/smp_affinity_list" > "${SYSBK}/irq_${irq}.aff" 2>/dev/null || true
 
-    local cpu="${IRQ_CPU_ARR[$((idx%NIRQCPU))]}"
+    # IRQ를 IRQ_CPUSET 내부에서 라운드-로빈으로 배치
+    local cpu="${IRQ_CPU_ARR[$((idx % NIRQCPU))]}"
+
+    # IRQ를 특정 단일 CPU에 고정
     echo "$cpu" > "/proc/irq/${irq}/smp_affinity_list" 2>/dev/null || true
+
     echo "[INFO] IRQ ${irq} -> CPU ${cpu}"
-    idx=$((idx+1))
+
+    idx=$((idx + 1))
   done
 
+  # 조작한 IRQ 목록 저장
   printf "%s\n" "${irqs[@]}" > "${SYSBK}/irq_list.txt"
 }
 
 # IRQ affinity를 백업 값으로 복구
 restore_irq_aff(){
   [[ -f "${SYSBK}/irq_list.txt" ]] || return 0
+
+  # 백업해둔 IRQ 목록을 한 줄씩 읽어 복구
+  # ${SYSBK}/irq_list.txt 파일에서 한 줄씩 읽기
+  #   조작된 IRQ에 대해서만 복구 수행
   while read -r irq; do
     [[ -f "/proc/irq/${irq}/smp_affinity_list" && -f "${SYSBK}/irq_${irq}.aff" ]] && \
       cat "${SYSBK}/irq_${irq}.aff" > "/proc/irq/${irq}/smp_affinity_list" || true
   done < "${SYSBK}/irq_list.txt"
+
   echo "[CLEANUP] IRQ smp_affinity_list restored"
 }
 
-# ksoftirqd pin/unpin
-# ksoftirqd/N 스레드를 IRQ_CPUSET 코어로 고정(가능한 범위에서)
-pin_ksoftirqd_all(){
-  [[ "${PIN_KSOFTIRQD}" = "1" ]] || { echo "[INFO] skip ksoftirqd pin"; return 0; }
 
-  ps -eLo pid,psr,comm | awk '$3 ~ /^ksoftirqd\/[0-9]+$/ {print $1,$2,$3}' | \
-  while read -r pid cpu comm; do
-    local n; n=${comm#ksoftirqd/}
-    if [[ ",$IRQ_CPULIST," == *",$n,"* ]]; then
-      taskset -p "$(printf %x $((1<<n)))" "$pid" >/dev/null 2>&1 || true
-      echo "$pid" > "${SYSBK}/ksoft_pid_${n}" 2>/dev/null || true
-      echo "[INFO] pinned $comm (pid=$pid) -> CPU $n"
-    fi
-  done
-}
+# ============================================================================
+# 종료 시 복구 함수
+# ============================================================================
 
-# ksoftirqd affinity를 가능한 범위에서 복구(best effort)
-restore_ksoft(){
-  shopt -s nullglob
-  for f in "${SYSBK}"/ksoft_pid_*; do
-    local n=${f##*_}
-    local pid; pid=$(cat "$f" 2>/dev/null || true)
-    [[ -n "$pid" ]] && taskset -p ff "$pid" >/dev/null 2>&1 || true
-  done
-  shopt -u nullglob
-  echo "[CLEANUP] ksoftirqd affinity restored (best effort)"
-}
-
-
-# IFACE TX 바이트 읽기 (참고용)
-read_tx_bytes(){ awk -v dev="$IFACE" '$1==dev":"{print $10}' /proc/net/dev 2>/dev/null | tr -d ' '; }
-
-
-# 종료 시 복구(trap)
 cleanup(){
   restore_irq_aff
   restore_queues
   restore_rps_xps
-  restore_ksoft
   restore_irqbalance
   cg_cleanup
 }
 trap cleanup EXIT
 
 
+# ============================================================================
+# 메인 실행 로직
+# ============================================================================
+
 # 최적화 적용
 echo "[INFO] IFACE=$IFACE  CPUSET=$CPUSET (NCPU=$NCPU)  IRQ_CPUSET=$IRQ_CPUSET (NIRQCPU=$NIRQCPU)  WORKERS=$WORKERS"
 stop_irqbalance
 [[ "${SET_RSS}" = "1" ]] && shrink_to_n "${RSS_QUEUES}"
 [[ "${PIN_IRQ}" = "1" ]] && affine_irqs_round_robin
-[[ "${SET_RPS_XPS}" = "1" ]] && disable_rps_xps
-[[ "${PIN_KSOFTIRQD}" = "1" ]] && pin_ksoftirqd_all
-
-
+[[ "${SET_RPS_XPS}" = "1" ]] && set_rps_xps
 
 # 서버 실행
 CMD_PREFIX=()
@@ -483,21 +583,51 @@ fi
 
 
 # 계산 및 결과 출력
-# Kernel 시간 합산 (CPUSET ∪ IRQ_CPUSET)
-sum_irq=0
-sum_sirq=0
-for c in "${MON_CPU_ARR[@]}"; do
-  sum_irq=$(awk -v s="$sum_irq" -v a="${S0_IRQ[$c]}"  -v b="${S1_IRQ[$c]}"  -v hz="$CLK_TCK" 'BEGIN{printf "%.6f", s+ (b-a)/hz}')
-  sum_sirq=$(awk -v s="$sum_sirq" -v a="${S0_SIRQ[$c]}" -v b="${S1_SIRQ[$c]}" -v hz="$CLK_TCK" 'BEGIN{printf "%.6f", s+ (b-a)/hz}')
+# Kernel 시간 합산 - 앱 코어와 IRQ 코어 분리 계산
+
+# IRQ 코어에서의 hardirq/softirq
+irq_core_irq=0
+irq_core_sirq=0
+for c in "${IRQ_CPU_ARR[@]}"; do
+  # 디버그: 원시 tick 값 출력
+  echo "[DEBUG] CPU $c: IRQ(${S0_IRQ[$c]} → ${S1_IRQ[$c]}), softirq(${S0_SIRQ[$c]} → ${S1_SIRQ[$c]})" >&2
+  irq_core_irq=$(awk -v s="$irq_core_irq" -v a="${S0_IRQ[$c]}"  -v b="${S1_IRQ[$c]}"  -v hz="$CLK_TCK" 'BEGIN{printf "%.6f", s+ (b-a)/hz}')
+  irq_core_sirq=$(awk -v s="$irq_core_sirq" -v a="${S0_SIRQ[$c]}" -v b="${S1_SIRQ[$c]}" -v hz="$CLK_TCK" 'BEGIN{printf "%.6f", s+ (b-a)/hz}')
 done
 
+# 앱 코어에서의 hardirq/softirq
+app_core_irq=0
+app_core_sirq=0
+for c in "${CPU_ARR[@]}"; do
+  # 디버그: 원시 tick 값 출력
+  echo "[DEBUG] CPU $c: IRQ(${S0_IRQ[$c]} → ${S1_IRQ[$c]}), softirq(${S0_SIRQ[$c]} → ${S1_SIRQ[$c]})" >&2
+  app_core_irq=$(awk -v s="$app_core_irq" -v a="${S0_IRQ[$c]}"  -v b="${S1_IRQ[$c]}"  -v hz="$CLK_TCK" 'BEGIN{printf "%.6f", s+ (b-a)/hz}')
+  app_core_sirq=$(awk -v s="$app_core_sirq" -v a="${S0_SIRQ[$c]}" -v b="${S1_SIRQ[$c]}" -v hz="$CLK_TCK" 'BEGIN{printf "%.6f", s+ (b-a)/hz}')
+done
+
+# 전체 합산 (CPUSET ∪ IRQ_CPUSET)
+sum_irq=$(awk -v a="$irq_core_irq" -v b="$app_core_irq" 'BEGIN{printf "%.6f", a+b}')
+sum_sirq=$(awk -v a="$irq_core_sirq" -v b="$app_core_sirq" 'BEGIN{printf "%.6f", a+b}')
+
 # softirq 중에서 ksoftirqd로 잡힌 부분을 별도로 계산하고, 나머지는 inline으로 계산
-ksum=0
-for n in "${MON_CPU_ARR[@]}"; do
+# IRQ 코어의 ksoftirqd
+irq_ksum=0
+for n in "${IRQ_CPU_ARR[@]}"; do
   k0="${KSOFT0_NS[$n]:-0}"
   k1="${KSOFT1_NS[$n]:-0}"
-  ksum=$(awk -v s="$ksum" -v a="$k0" -v b="$k1" 'BEGIN{printf "%.6f", s+ (b-a)/1e9}')
+  irq_ksum=$(awk -v s="$irq_ksum" -v a="$k0" -v b="$k1" 'BEGIN{printf "%.6f", s+ (b-a)/1e9}')
 done
+
+# 앱 코어의 ksoftirqd
+app_ksum=0
+for n in "${CPU_ARR[@]}"; do
+  k0="${KSOFT0_NS[$n]:-0}"
+  k1="${KSOFT1_NS[$n]:-0}"
+  app_ksum=$(awk -v s="$app_ksum" -v a="$k0" -v b="$k1" 'BEGIN{printf "%.6f", s+ (b-a)/1e9}')
+done
+
+# 전체 ksoftirqd 합계
+ksum=$(awk -v a="$irq_ksum" -v b="$app_ksum" 'BEGIN{printf "%.6f", a+b}')
 sirq_inline=$(awk -v so="$sum_sirq" -v kr="$ksum" 'BEGIN{d=so-kr; if(d<0)d=0; printf "%.6f", d;}')
 
 # cgroup 통계 (usec → sec)
@@ -525,11 +655,24 @@ printf "# App (cgroup v2, 전체 스레드)\n"
 printf "cgroup total     : %.3f s   → %.3f s/GB(payload)\n" "$CG_TOT"  "$(S2GB "$CG_TOT" "$PAYLOAD_BYTES")"
 printf "  user/system    : %.3f / %.3f s\n\n" "$CG_USER" "$CG_SYS"
 
-printf "# Kernel (CPUSET ∪ IRQ_CPUSET에서의 IRQ/softirq)\n"
-printf "softirq(total)   : %.3f s   → %.3f s/GB(payload)\n" "$sum_sirq"    "$(S2GB "$sum_sirq" "$PAYLOAD_BYTES")"
-printf "  ├─ ksoftirqd   : %.3f s   → %.3f s/GB(payload)\n" "$ksum"        "$(S2GB "$ksum"     "$PAYLOAD_BYTES")"
-printf "  └─ inline      : %.3f s   → %.3f s/GB(payload)\n" "$sirq_inline" "$(S2GB "$sirq_inline" "$PAYLOAD_BYTES")"
-printf "IRQ(hard)        : %.3f s   → %.3f s/GB(payload)\n\n" "$sum_irq"     "$(S2GB "$sum_irq"  "$PAYLOAD_BYTES")"
+printf "# Kernel Interrupt Breakdown\n"
+printf "\n[IRQ Core: CPU %s]\n" "$IRQ_CPULIST"
+printf "  hardirq        : %.3f s   → %.3f s/GB(payload)\n" "$irq_core_irq"  "$(S2GB "$irq_core_irq" "$PAYLOAD_BYTES")"
+printf "  softirq(total) : %.3f s   → %.3f s/GB(payload)\n" "$irq_core_sirq" "$(S2GB "$irq_core_sirq" "$PAYLOAD_BYTES")"
+printf "    ├─ ksoftirqd : %.3f s   → %.3f s/GB(payload)\n" "$irq_ksum"      "$(S2GB "$irq_ksum" "$PAYLOAD_BYTES")"
+printf "    └─ inline    : %.3f s\n" "$(awk -v so="$irq_core_sirq" -v kr="$irq_ksum" 'BEGIN{d=so-kr; if(d<0)d=0; printf "%.3f", d;}')"
+
+printf "\n[App Core: CPU %s]\n" "$CPULIST"
+printf "  hardirq        : %.3f s   → %.3f s/GB(payload)\n" "$app_core_irq"  "$(S2GB "$app_core_irq" "$PAYLOAD_BYTES")"
+printf "  softirq(total) : %.3f s   → %.3f s/GB(payload)\n" "$app_core_sirq" "$(S2GB "$app_core_sirq" "$PAYLOAD_BYTES")"
+printf "    ├─ ksoftirqd : %.3f s   → %.3f s/GB(payload)\n" "$app_ksum"      "$(S2GB "$app_ksum" "$PAYLOAD_BYTES")"
+printf "    └─ inline    : %.3f s\n" "$(awk -v so="$app_core_sirq" -v kr="$app_ksum" 'BEGIN{d=so-kr; if(d<0)d=0; printf "%.3f", d;}')"
+
+printf "\n[Total: CPUSET ∪ IRQ_CPUSET]\n"
+printf "  hardirq        : %.3f s   → %.3f s/GB(payload)\n" "$sum_irq"       "$(S2GB "$sum_irq" "$PAYLOAD_BYTES")"
+printf "  softirq(total) : %.3f s   → %.3f s/GB(payload)\n" "$sum_sirq"      "$(S2GB "$sum_sirq" "$PAYLOAD_BYTES")"
+printf "    ├─ ksoftirqd : %.3f s   → %.3f s/GB(payload)\n" "$ksum"          "$(S2GB "$ksum" "$PAYLOAD_BYTES")"
+printf "    └─ inline    : %.3f s   → %.3f s/GB(payload)\n\n" "$sirq_inline"   "$(S2GB "$sirq_inline" "$PAYLOAD_BYTES")"
 
 printf "# Combined (중복 카운트 없음)\n"
 printf "TOTAL (App+soft+IRQ): %.3f s  → %.3f s/GB(payload)\n" "$TOTAL_TRUE" "$(S2GB "$TOTAL_TRUE" "$PAYLOAD_BYTES")"
