@@ -448,12 +448,24 @@ static int send_file_chunk(conn_t *c) {
         long pg = sysconf(_SC_PAGESIZE);    /** 페이지 크기(보통 4KB) */
 
         size_t need = IO_BUFSZ;
+
+        /** 
+         * 버퍼 크기를 페이지 크기의 배수로 보정
+         * - 메모리 낭비 최소화 (마지막 페이지 완전 활용)
+         */
         if (need % (size_t)pg) {
-            need += (size_t)pg - (need % (size_t)pg);   /** 페이지 크기 배수로 맞춤 */
+            need += (size_t)pg - (need % (size_t)pg); 
         }
 
+        /** 
+         * 페이지 경계에 정렬된 메모리 할당
+         * - 주소 정렬: TLB 효율 향상 (미미)
+         * - 파일 open시 O_DIRECT(DMA) 사용 - 성능 향상 기대 (현재는 미사용)
+         *      > 파일 크기, 읽기 횟수, 캐시 사용률, 읽기 방식(순차,랜덤)에 따라 효과 다름
+         *      > sendfile은 의미 없음 (버퍼 사용 x)
+         */
         if (posix_memalign((void **)&c->buf, (size_t)pg, need) != 0) {
-            c->buf = malloc(need);      /** 정렬 실패 시 malloc으로 폴백 */
+            c->buf = malloc(need);      /** 정렬 실패 시 일반 malloc */
         }
         c->bufsz = need;
     }
