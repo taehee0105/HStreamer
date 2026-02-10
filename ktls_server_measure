@@ -514,7 +514,9 @@ done
 
 
 # 스냅샷(측정 시작 시점)
-declare -A S0_IRQ S0_SIRQ
+# declare -A: 연관배열 선언
+#   일반 배열과 달리 문자열을 인덱스로 사용
+declare -A S0_IRQ S0_SIRQ   
 for c in "${MON_CPU_ARR[@]}"; do
   line=$(read_proc_stat_line "cpu${c}")
   read hi so < <(extract_irq_soft "$line")
